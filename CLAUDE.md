@@ -30,6 +30,11 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   DECISION: displayctl skips test() when HYPRLAND_INSTANCE_SIGNATURE is set
   (local checks + hyprctl cross-check instead); other compositors keep it.
   Worth reporting upstream (see docs/hyprland-persistence.md).
+- Hyprland sends `done` only to the client that applied a change; clients that
+  only watch get the head updates without `done`. gui.py refreshes after any
+  batch that arrives without `done`. A watcher's serial goes stale; test
+  whether that matters before the GUI applies. A watching connection does
+  NOT block other clients' applies.
 - "succeeded" doesn't prove anything happened: always re-read and verify.
 - kanshi: config at ~/.config/kanshi/config (profiles external / extend /
   laptop / undocked; "external" disables eDP-1). hyprland.lua STARTS IT AT
@@ -51,16 +56,22 @@ Backend protocol: wlr-output-management-unstable-v1
 (XML at /usr/share/wlr-protocols/unstable/). Venv: .venv (system site packages).
 Files: backend.py (Wayland), displayctl.py (CLI), watchdog.py (revert
 process), gui.py (GTK4 GUI; Wayland fd in the GLib main loop, one persistent
-connection, redraws on every 'done').
+connection, redraws on every 'done' or done-less update batch; `--debug`
+logs fd wakeups, refreshes and redraws).
 
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and fights displayctl).
 1. Phase 3 step 2: drag-to-arrange on the canvas (still no applying), then
    applying from the GUI with the 15 s keep/revert. Revert through the GUI's
    OWN connection; watchdog only as crash fallback.
-2. Check the GUI's live refresh: keep it open and change a mode with
-   displayctl.py in kitty; the canvas should update on the 'done' event
-   (only tested in-memory so far).
+2. GUI design notes (queued, from review of step 1):
+   - show disabled monitors as dimmed rectangles on the canvas
+   - more padding around the layout on the canvas
+   - bigger monitor labels
+   - details panel: settings (mode, refresh, scale, position, rotation) at
+     the top; identity (make, model, serial, physical size) in a lower
+     "About this display" section; drop the Description row
+   - Before the GUI applies: test whether a stale serial gets cancelled.
 3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
    docs/hyprland-persistence.md; open points listed there).
 4. Optional, later: startup-race test; report the test() side effect upstream.

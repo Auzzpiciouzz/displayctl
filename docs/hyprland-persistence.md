@@ -133,6 +133,26 @@ at login (`hl.exec_cmd("kanshi")`), whose `external` profile disables eDP-1.
   enabled/mode/position with `hyprctl monitors all -j` before snapshotting
   and refuses to apply if they disagree (prints both views).
 
+### No 'done' for clients that only watch
+
+With gui.py open (its own connection, not applying anything),
+`displayctl.py set DP-3 --mode 2560x1440@144` worked (hyprctl: 143.99), and
+the GUI's connection received the head updates (`enabled`, `position`,
+`current_mode` = the 144 Hz mode, ...) but **no
+`zwlr_output_manager_v1.done`**. The client that applies a change does get
+`done`. The protocol requires `done` after every batch of changes, so this is
+another Hyprland deviation (also worth reporting upstream).
+- The GUI's open connection does NOT block other clients' applies.
+- Workaround in gui.py: after dispatching a batch, if no `done` arrived,
+  refresh anyway (the connection carries only output-management events and
+  Hyprland sends each change as one burst). Verified: the GUI followed
+  200 -> 144 -> 200 live.
+- Consequence for later: a watching client's `serial` stays at its last
+  `done`, so it's stale after changes made by others (kanshi, displayctl,
+  hotplug). When the GUI applies, it may need a fresh serial, e.g. by
+  reconnecting the manager, or Hyprland may not check serials at all.
+  To test before the GUI applies anything.
+
 ## Phase 4 design: rule-based dock switching on Hyprland
 
 Goal: on Hyprland the config rules are the single source of truth for

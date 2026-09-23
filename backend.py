@@ -151,6 +151,10 @@ class OutputManager:
         # compositor has finished describing a (new) consistent state.
         # The GUI adds one to redraw; the CLI doesn't use it.
         self.listeners = []
+        # How many 'done' events we've seen. The GUI compares this before and
+        # after dispatching to spot changes that arrived WITHOUT a 'done'
+        # (Hyprland 0.56.2 doesn't send 'done' to clients that only watch).
+        self.done_count = 0
 
         registry = self.display.get_registry()
         registry.dispatcher["global"] = self._on_global
@@ -227,6 +231,7 @@ class OutputManager:
 
     def _on_done(self, manager, serial):
         self.serial = serial
+        self.done_count += 1
         for listener in list(self.listeners):
             listener()
 

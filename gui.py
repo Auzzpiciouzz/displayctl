@@ -21,6 +21,7 @@ only the connection that applied a change can revert it (see
 docs/hyprland-persistence.md).
 """
 
+import logging
 import sys
 
 import gi
@@ -33,6 +34,21 @@ from gi.repository import Adw, GLib, GLibUnix, Gtk, Pango, PangoCairo  # noqa: E
 from backend import TRANSFORMS, OutputManager, WaylandError  # noqa: E402
 
 APP_ID = "dev.displayctl.App"
+
+# `gui.py --debug` logs every fd wakeup, 'done' event and redraw to stderr.
+# (Add WAYLAND_DEBUG=1 for libwayland's per-message trace as well.)
+log = logging.getLogger("displayctl.gui")
+
+
+def describe_heads(heads):
+    """Compact one-line state summary for the debug log."""
+    parts = []
+    for h in heads:
+        m = h.current_mode
+        mode = f"{m.width}x{m.height}@{m.refresh_mhz}" if (h.enabled and m) else "-"
+        parts.append(f"{h.name}:{'on' if h.enabled else 'off'} {mode} "
+                     f"pos {h.position[0]},{h.position[1]}")
+    return " | ".join(parts)
 MARGIN = 24  # empty space (px) around the layout on the canvas
 
 
@@ -55,9 +71,10 @@ class WaylandSource:
       flush()     send any requests we queued in those handlers
     """
 
-    def __init__(self, om, on_error):
+    def __init__(self, om, on_error, on_changed):
         self.om = om
         self.on_error = on_error
+        self.on_changed = on_changed
         # Events can already be queued from OutputManager's startup
         # roundtrips; handle them before we start sleeping on the fd.
         om.display.dispatch()
@@ -70,10 +87,12 @@ class WaylandSource:
         )
 
     def _on_fd(self, fd, condition):
+        log.debug("fd %d readable (condition %s)", fd, condition)
         if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
             self.on_error("The compositor closed the connection.")
             self.source_id = None
             return GLib.SOURCE_REMOVE  # stop watching a dead fd
+        dones_before = self.om.done_count
         try:
             self.om.display.read()
             self.om.display.dispatch()
@@ -82,6 +101,15 @@ class WaylandSource:
             self.on_error(f"Wayland error: {e}")
             self.source_id = None
             return GLib.SOURCE_REMOVE
+        if self.om.done_count == dones_before:
+            # Something changed but no 'done' came with it. The protocol
+            # says the compositor must send 'done' to every client after a
+            # batch of changes; Hyprland 0.56.2 only sends it to the client
+            # that applied the change. This connection only carries
+            # output-management events, and Hyprland sends a change as one
+            # burst that we just dispatched in full, so refresh now.
+            log.debug("state changed without a 'done' event; refreshing anyway")
+            self.on_changed()
         return GLib.SOURCE_CONTINUE  # keep watching
 
     def stop(self):
@@ -119,6 +147,7 @@ class LayoutCanvas(Gtk.DrawingArea):
 
     def _draw(self, area, cr, width, height):
         heads = self._enabled_heads()
+        log.debug("redraw %dx%d: %s", width, height, describe_heads(heads))
         self._hit_boxes = []
         if not heads:
             return
@@ -295,6 +324,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.details.show_head(self.om.head(name) if name else None)
 
     def refresh(self):
+        log.debug("refresh (last done serial %s): %s", self.om.serial, describe_heads(self.om.heads))
         enabled = sum(1 for h in self.om.heads if h.enabled)
         disabled = len(self.om.heads) - enabled
         self.window_title.set_subtitle(f"{enabled} enabled, {disabled} disabled · read-only")
@@ -330,7 +360,7 @@ class DisplayctlApp(Adw.Application):
             self.quit()
             return
         self.window = MainWindow(self, self.om)
-        self.source = WaylandSource(self.om, self.window.show_error)
+        self.source = WaylandSource(self.om, self.window.show_error, self.window.refresh)
         self.window.present()
 
     def _on_shutdown(self, app):
@@ -341,4 +371,10 @@ class DisplayctlApp(Adw.Application):
 
 
 if __name__ == "__main__":
-    sys.exit(DisplayctlApp().run(sys.argv))
+    # Our own flag, removed before GTK sees argv (it rejects unknown options).
+    argv = [a for a in sys.argv if a != "--debug"]
+    logging.basicConfig(
+        level=logging.DEBUG if len(argv) != len(sys.argv) else logging.WARNING,
+        format="%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S",
+    )
+    sys.exit(DisplayctlApp().run(argv))
