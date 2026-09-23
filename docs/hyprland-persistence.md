@@ -153,6 +153,43 @@ another Hyprland deviation (also worth reporting upstream).
   reconnecting the manager, or Hyprland may not check serials at all.
   To test before the GUI applies anything.
 
+### Stale serials are ignored
+
+Test (`displayctl.py set DP-3 --mode 2560x1440@180 --stale-serial-test`):
+connection A opened with serial 461; a separate displayctl run changed DP-3
+to 144 Hz and kept it (fresh serial now 465); A then applied 180 Hz with
+`create_configuration(461)`. Hyprland answered **succeeded** and the change
+**took effect** (verified on a fresh connection); the watchdog reverted it
+(verified), then DP-3 was restored to 200 Hz. The protocol says a stale serial
+must be answered `cancelled`: Hyprland 0.56.2 doesn't check serials.
+
+## GUI apply strategy (decided from the tests above)
+
+**On Hyprland: keep the single persistent connection** for watching, applying
+and reverting. A fresh connection per apply buys nothing, because serials
+aren't checked. Instead the safety comes from:
+1. the live-refreshed state (gui.py refreshes on `done` and on done-less
+   update batches), so what the user edits starts from the current layout;
+2. the protocol-vs-hyprctl cross-check right before every apply (as
+   displayctl does); refuse and show both views if they disagree;
+3. every configuration restating all enabled heads in full;
+4. verify after apply and after revert on a fresh read.
+
+Because Hyprland ignores serials, it will NOT stop the GUI from applying on
+top of a change another client made a moment ago. Steps 1 and 2 are what
+prevent that; don't drop them.
+
+**Revert:** through the same connection that applied (tested: works; another
+client's revert is ignored while it's connected). The watchdog, armed before
+each apply, is only the crash fallback (the GUI's connection closes when it
+dies, then the watchdog's revert works).
+
+**Other compositors** (wlroots-based ones check serials): if an apply comes
+back `cancelled`, re-read the state (a watcher there does get `done`, so the
+serial is fresh after dispatching), show the user the new layout, and let
+them retry. Don't retry automatically: the layout they edited may no longer
+make sense.
+
 ## Phase 4 design: rule-based dock switching on Hyprland
 
 Goal: on Hyprland the config rules are the single source of truth for

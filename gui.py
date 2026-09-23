@@ -2,7 +2,7 @@
 """displayctl GUI, Phase 3 step 1: a READ-ONLY view of the monitor layout.
 
 A canvas draws every enabled monitor as a rectangle at its real position and
-relative size. Clicking one shows its details in the side panel. Nothing is
+relative size (disabled ones dimmed, off to the right). Clicking one shows its details in the side panel. Nothing is
 ever applied from here yet.
 
 How Wayland and GTK share one thread
@@ -49,7 +49,7 @@ def describe_heads(heads):
         parts.append(f"{h.name}:{'on' if h.enabled else 'off'} {mode} "
                      f"pos {h.position[0]},{h.position[1]}")
     return " | ".join(parts)
-MARGIN = 24  # empty space (px) around the layout on the canvas
+PADDING = 56  # empty space (px) around the layout on the canvas
 
 
 def format_hz(refresh_mhz, decimals=3):
@@ -122,7 +122,12 @@ class WaylandSource:
 
 
 class LayoutCanvas(Gtk.DrawingArea):
-    """Draws enabled monitors to scale; click one to select it."""
+    """Draws monitors to scale; click one to select it.
+
+    Enabled monitors sit at their real position. Disabled ones have no
+    position in the layout, so they're drawn dimmed with a dashed border in
+    a row to the right, at their preferred mode's size.
+    """
 
     def __init__(self, om, on_select):
         super().__init__(hexpand=True, vexpand=True)
@@ -142,77 +147,105 @@ class LayoutCanvas(Gtk.DrawingArea):
         style.connect("notify::dark", lambda *_: self.queue_draw())
         style.connect("notify::accent-color-rgba", lambda *_: self.queue_draw())
 
-    def _enabled_heads(self):
-        return [h for h in self.om.heads if h.enabled and h.current_mode is not None]
+    def _layout_boxes(self):
+        """(head, x, y, w, h, enabled) for every head, in compositor units."""
+        boxes = []
+        on = [h for h in self.om.heads if h.enabled and h.current_mode is not None]
+        for head in on:
+            w, h = head.logical_size()
+            boxes.append((head, head.position[0], head.position[1], w, h, True))
+
+        # Disabled heads: a row starting one "gap" to the right of the layout.
+        right = max((b[1] + b[3] for b in boxes), default=0)
+        top = min((b[2] for b in boxes), default=0)
+        gap = max(right // 12, 200)  # spacing, scaled to the layout
+        x = right + gap if boxes else 0
+        for head in self.om.heads:
+            if head in on:
+                continue
+            mode = head.preferred_mode()
+            if mode is None:
+                continue  # nothing to size it by
+            boxes.append((head, x, top, mode.width, mode.height, False))
+            x += mode.width + gap
+        return boxes
 
     def _draw(self, area, cr, width, height):
-        heads = self._enabled_heads()
-        log.debug("redraw %dx%d: %s", width, height, describe_heads(heads))
+        boxes = self._layout_boxes()
+        log.debug("redraw %dx%d: %s", width, height, describe_heads(self.om.heads))
         self._hit_boxes = []
-        if not heads:
+        if not boxes:
             return
 
-        # 1. Bounding box of the whole layout in compositor coordinates
+        # 1. Bounding box of everything we draw, in compositor coordinates
         #    (logical size = pixels / scale, swapped when rotated).
-        boxes = []
-        for head in heads:
-            w, h = head.logical_size()
-            x, y = head.position
-            boxes.append((head, x, y, w, h))
         left = min(b[1] for b in boxes)
         top = min(b[2] for b in boxes)
         right = max(b[1] + b[3] for b in boxes)
         bottom = max(b[2] + b[4] for b in boxes)
 
         # 2. One scale factor for both axes keeps the real proportions;
-        #    then centre the layout in the widget.
-        factor = min((width - 2 * MARGIN) / (right - left),
-                     (height - 2 * MARGIN) / (bottom - top))
+        #    then centre the layout in the widget, with padding all round.
+        factor = min((width - 2 * PADDING) / (right - left),
+                     (height - 2 * PADDING) / (bottom - top))
         offset_x = (width - (right - left) * factor) / 2
         offset_y = (height - (bottom - top) * factor) / 2
 
         fg = self.get_color()  # the theme's text colour (light or dark)
         accent = Adw.StyleManager.get_default().get_accent_color_rgba()
 
-        for head, x, y, w, h in boxes:
+        for head, x, y, w, h, enabled in boxes:
             sx = offset_x + (x - left) * factor
             sy = offset_y + (y - top) * factor
-            sw, sh = w * factor, h * factor
             # A small gap so touching monitors stay visually separate.
             gap = 3
-            rect = (sx + gap, sy + gap, sw - 2 * gap, sh - 2 * gap)
+            rect = (sx + gap, sy + gap, w * factor - 2 * gap, h * factor - 2 * gap)
             self._hit_boxes.append((head.name, *rect))
-            is_selected = head.name == self.selected
+            selected = head.name == self.selected
+            dim = 1.0 if enabled else 0.5  # disabled monitors are drawn faded
 
             # Fill
-            if is_selected:
-                cr.set_source_rgba(accent.red, accent.green, accent.blue, 0.30)
+            if selected:
+                cr.set_source_rgba(accent.red, accent.green, accent.blue, 0.30 * dim)
             else:
-                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.08)
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.08 * dim)
             cr.rectangle(*rect)
             cr.fill_preserve()  # keep the path to draw the border next
-            # Border
-            if is_selected:
-                cr.set_source_rgba(accent.red, accent.green, accent.blue, 1.0)
+
+            # Border: dashed for disabled monitors.
+            cr.set_dash([] if enabled else [6, 4])
+            if selected:
+                cr.set_source_rgba(accent.red, accent.green, accent.blue, dim)
                 cr.set_line_width(3)
             else:
-                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.45)
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.45 * dim)
                 cr.set_line_width(1.5)
             cr.stroke()
+            cr.set_dash([])
 
-            # Label: name (bold) and mode, centred in the rectangle.
-            mode = head.current_mode
-            markup = (
-                f"<b>{GLib.markup_escape_text(head.name)}</b>\n"
-                f"{mode.width}×{mode.height} @ {format_hz(mode.refresh_mhz, 2)} Hz"
-            )
-            layout = self.create_pango_layout(None)
-            layout.set_markup(markup, -1)
-            layout.set_alignment(Pango.Alignment.CENTER)
+            self._draw_label(cr, head, enabled, rect, fg, dim)
+
+    def _draw_label(self, cr, head, enabled, rect, fg, dim):
+        """Name (large, bold) and mode or "Disabled", centred in `rect`."""
+        if enabled:
+            m = head.current_mode
+            detail = f"{m.width}×{m.height} @ {format_hz(m.refresh_mhz, 2)} Hz"
+        else:
+            detail = "Disabled"
+        name = GLib.markup_escape_text(head.name)
+        layout = self.create_pango_layout(None)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        # Try big labels first; shrink until they fit inside the rectangle.
+        for name_size, detail_size in ((180, 125), (140, 110), (100, 90)):
+            layout.set_markup(
+                f'<span size="{name_size}%" weight="bold">{name}</span>\n'
+                f'<span size="{detail_size}%">{GLib.markup_escape_text(detail)}</span>', -1)
             text_w, text_h = layout.get_pixel_size()
-            cr.set_source_rgba(fg.red, fg.green, fg.blue, 1.0)
-            cr.move_to(rect[0] + (rect[2] - text_w) / 2, rect[1] + (rect[3] - text_h) / 2)
-            PangoCairo.show_layout(cr, layout)
+            if text_w <= rect[2] - 12 and text_h <= rect[3] - 12:
+                break
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, dim)
+        cr.move_to(rect[0] + (rect[2] - text_w) / 2, rect[1] + (rect[3] - text_h) / 2)
+        PangoCairo.show_layout(cr, layout)
 
     def _on_click(self, gesture, n_press, x, y):
         clicked = None
@@ -229,13 +262,19 @@ class LayoutCanvas(Gtk.DrawingArea):
 
 
 class DetailsPanel(Gtk.Stack):
-    """Side panel: a placeholder, or the selected monitor's details."""
+    """Side panel: a placeholder, or the selected monitor's details.
 
-    FIELDS = [
-        ("Name", "name"), ("Description", "description"), ("Make", "make"),
-        ("Model", "model"), ("Serial", "serial"), ("Resolution", "resolution"),
-        ("Refresh rate", "refresh"), ("Scale", "scale"), ("Position", "position"),
-        ("Rotation", "transform"), ("Physical size", "physical"),
+    Top: the settings (what later becomes editable). Below: "About this
+    display", the fixed identity of the hardware.
+    """
+
+    SETTINGS = [
+        ("Status", "status"), ("Resolution", "resolution"), ("Refresh rate", "refresh"),
+        ("Scale", "scale"), ("Position", "position"), ("Rotation", "transform"),
+    ]
+    ABOUT = [
+        ("Connector", "name"), ("Make", "make"), ("Model", "model"),
+        ("Serial number", "serial"), ("Physical size", "physical"),
     ]
 
     def __init__(self):
@@ -251,35 +290,43 @@ class DetailsPanel(Gtk.Stack):
         placeholder.add_css_class("compact")
         self.add_named(placeholder, "empty")
 
-        group = Adw.PreferencesGroup(title="Details")
         self.rows = {}
-        for title, key in self.FIELDS:
+        page = Adw.PreferencesPage()
+        self.settings_group = self._group(page, "Settings", self.SETTINGS)
+        self._group(page, "About this display", self.ABOUT)
+        self.add_named(page, "details")
+
+    def _group(self, page, title, fields):
+        group = Adw.PreferencesGroup(title=title)
+        for label, key in fields:
             # "property" style: small title above a prominent value
             # (the subtitle), which wraps cleanly when it's long.
-            row = Adw.ActionRow(title=title, subtitle_selectable=True)
+            row = Adw.ActionRow(title=label, subtitle_selectable=True)
             row.add_css_class("property")
             group.add(row)
             self.rows[key] = row
-        page = Adw.PreferencesPage()
         page.add(group)
-        self.add_named(page, "details")
+        return group
 
     def show_head(self, head):
         if head is None:
             self.set_visible_child_name("empty")
             return
-        mode = head.current_mode
+        # The settings group is headed by the connector name, e.g. "DP-3".
+        self.settings_group.set_title(GLib.markup_escape_text(head.name))
+        mode = head.current_mode if head.enabled else None
+        off = "—"
         values = {
+            "status": "Enabled" if head.enabled else "Disabled",
+            "resolution": f"{mode.width} × {mode.height}" if mode else off,
+            "refresh": f"{format_hz(mode.refresh_mhz)} Hz" if mode else off,
+            "scale": f"{head.scale:g}" if head.enabled else off,
+            "position": f"{head.position[0]}, {head.position[1]}" if head.enabled else off,
+            "transform": TRANSFORMS.get(head.transform, str(head.transform)) if head.enabled else off,
             "name": head.name,
-            "description": head.description,
-            "make": head.make,
-            "model": head.model,
+            "make": head.make or off,
+            "model": head.model or off,
             "serial": head.serial or "(none)",
-            "resolution": f"{mode.width} × {mode.height}" if mode else "—",
-            "refresh": f"{format_hz(mode.refresh_mhz)} Hz" if mode else "—",
-            "scale": f"{head.scale:g}",
-            "position": f"{head.position[0]}, {head.position[1]}",
-            "transform": TRANSFORMS.get(head.transform, str(head.transform)),
             "physical": f"{head.physical_size[0]} × {head.physical_size[1]} mm",
         }
         for key, text in values.items():
@@ -328,11 +375,10 @@ class MainWindow(Adw.ApplicationWindow):
         enabled = sum(1 for h in self.om.heads if h.enabled)
         disabled = len(self.om.heads) - enabled
         self.window_title.set_subtitle(f"{enabled} enabled, {disabled} disabled · read-only")
-        # The selected monitor may have been unplugged or disabled.
+        # The selected monitor may have been unplugged.
         head = self.om.head(self.canvas.selected) if self.canvas.selected else None
-        if head is None or not head.enabled:
+        if head is None:
             self.canvas.selected = None
-            head = None
         self.details.show_head(head)
         self.canvas.queue_draw()
 

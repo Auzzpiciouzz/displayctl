@@ -32,9 +32,12 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   Worth reporting upstream (see docs/hyprland-persistence.md).
 - Hyprland sends `done` only to the client that applied a change; clients that
   only watch get the head updates without `done`. gui.py refreshes after any
-  batch that arrives without `done`. A watcher's serial goes stale; test
-  whether that matters before the GUI applies. A watching connection does
-  NOT block other clients' applies.
+  batch that arrives without `done`. A watching connection does NOT block
+  other clients' applies.
+- Hyprland ignores the serial in create_configuration (tested: a stale serial
+  was applied, not cancelled). GUI keeps ONE connection; safety = live state
+  + hyprctl cross-check before each apply (see "GUI apply strategy" in
+  docs/hyprland-persistence.md).
 - "succeeded" doesn't prove anything happened: always re-read and verify.
 - kanshi: config at ~/.config/kanshi/config (profiles external / extend /
   laptop / undocked; "external" disables eDP-1). hyprland.lua STARTS IT AT
@@ -71,7 +74,6 @@ logs fd wakeups, refreshes and redraws).
    - details panel: settings (mode, refresh, scale, position, rotation) at
      the top; identity (make, model, serial, physical size) in a lower
      "About this display" section; drop the Description row
-   - Before the GUI applies: test whether a stale serial gets cancelled.
 3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
    docs/hyprland-persistence.md; open points listed there).
 4. Optional, later: startup-race test; report the test() side effect upstream.

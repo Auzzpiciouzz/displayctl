@@ -261,7 +261,70 @@ def confirm(seconds):
 # --- set ---------------------------------------------------------------------------
 
 
+def stale_serial_test(args):
+    """Experiment: does Hyprland check the serial in create_configuration?
+
+    The GUI keeps one connection open, and (Hyprland finding) a watching
+    connection gets no 'done' events, so its serial goes stale when another
+    client changes the outputs. This test:
+      1. opens connection A and remembers its serial
+      2. runs a separate, normal displayctl (own snapshot + watchdog) that
+         changes the output to --stale-intermediate and keeps it
+      3. snapshots the real state on a fresh connection, arms the watchdog
+      4. applies --mode through A, i.e. with A's old serial
+    The protocol says a stale serial should be answered 'cancelled'.
+    """
+    om_a = OutputManager()
+    stale = om_a.serial
+    print(f"Connection A open, serial {stale}")
+
+    w, h, r = args.stale_intermediate
+    other = [sys.executable, str(HERE / "displayctl.py"), "set", args.output,
+             "--mode", f"{w}x{h}@{r / 1000:g}", "--auto-keep"]
+    print(f"Another client changes {args.output} to {w}x{h}@{r / 1000:g} and keeps it...")
+    if subprocess.run(other, stdin=subprocess.DEVNULL).returncode != 0:
+        om_a.close()
+        die("the other client's change failed; stopping")
+
+    lock = take_lock()
+    # A's view is stale by design, so snapshot and check the REAL state on a
+    # fresh connection. The revert must restore what's actually on screen.
+    with OutputManager() as fresh:
+        print(f"Fresh connection serial {fresh.serial} (A still has {stale})")
+        problems = hyprland_disagreements(fresh.heads)
+        if problems:
+            om_a.close()
+            die("protocol and hyprctl disagree: " + "; ".join(problems))
+        snapshot = fresh.snapshot()
+        desired = build_desired(fresh, args)
+    save_json(LAST_GOOD, snapshot)
+    watchdog = start_watchdog(lock, CONFIRM_SECONDS)
+
+    result = om_a.run_configuration(desired, "apply")
+    print(f"RESULT: apply through A with stale serial {stale}: {result}")
+    problems, _ = verify_state(desired)
+    took = not problems
+    print(f"The requested change {'TOOK EFFECT' if took else 'did not take effect'}"
+          + ("" if took else ": " + "; ".join(problems)))
+
+    if result == "succeeded" or took:
+        # Something may have changed: close A (so another client's revert
+        # works, see findings), then let the watchdog restore the snapshot.
+        tell(watchdog, "applied")
+        om_a.close()
+        tell(watchdog, "revert")
+        wait_for_revert(watchdog)
+    else:
+        om_a.close()
+        tell(watchdog, "keep")  # nothing was applied
+        watchdog.wait(timeout=10)
+        print("Nothing to revert.")
+
+
 def cmd_set(args):
+    if args.stale_serial_test:
+        stale_serial_test(args)
+        return
     lock = take_lock()
     om = OutputManager()
     try:
@@ -459,6 +522,10 @@ def main():
     p.add_argument("--self-revert-test", type=float, metavar="SECONDS",
                    help=argparse.SUPPRESS)
     p.add_argument("--self-revert-via", choices=["same", "helper"], default="same",
+                   help=argparse.SUPPRESS)
+    # Hidden: stale-serial experiment (see stale_serial_test).
+    p.add_argument("--stale-serial-test", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--stale-intermediate", type=parse_mode, default=(2560, 1440, 144000),
                    help=argparse.SUPPRESS)
 
     args = parser.parse_args()
