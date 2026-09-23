@@ -266,9 +266,15 @@ In the same live test, the idle GUI was a pure watcher on a fresh connection
 (it had not applied anything on it), yet its pushed updates were one change
 behind for eDP-1: "off" when eDP-1 came on, "on" when it went off. (An
 earlier DP-3 mode change was reported correctly, so it may be specific to
-enabling/disabling.) Proposed fix: on every update wakeup, re-read on a fresh
-connection (debounced ~300 ms) and sync, instead of trusting pushed state.
-Not implemented yet.
+enabling/disabling.)
+
+**Fix (implemented):** gui.py treats a push only as "something changed":
+300 ms after the last push it reads the state on a fresh connection and uses
+that. Live test 2026-09-23 (GUI idle; displayctl changed eDP-1 on, off, DP-3
+144, 200): the pushed state was stale for both eDP-1 changes and correct for
+the mode changes; the GUI's view matched hyprctl after +0.38, +1.02, +0.31,
++0.44 s. The slow one: Hyprland pushed ~0.35 s after the change and the
+fresh read itself took 0.36 s (Hyprland busy disabling the panel).
 
 ## Phase 4 design: rule-based dock switching on Hyprland
 

@@ -32,8 +32,10 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   Worth reporting upstream (see docs/hyprland-persistence.md).
 - The applying client is sent the head state from BEFORE its own commit and
   nothing after (its view is one change behind); watchers also got stale
-  enable/disable state. Fresh reads are right. The GUI syncs its view from a
-  fresh read during the hold and reconnects after every transaction;
+  enable/disable state. Fresh reads are right. The GUI treats pushes only as
+  "something changed" and re-reads on a fresh connection 300 ms after the
+  last push; it also syncs during the hold and reconnects after every
+  transaction;
   displayctl verifies its own apply (twice) before asking Keep.
 - Hyprland sends `done` only to the client that applied a change; clients that
   only watch get the head updates without `done`. gui.py refreshes after any
@@ -76,9 +78,7 @@ GTK); gui.py handles edits from GLib.idle_add.
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and blocks other tools),
   and don't use nwg-displays alongside (it's another output-management tool).
-1. Decide: the idle GUI (a pure watcher) was still one change behind for
-   eDP-1 on/off. Proposed: on every update wakeup, re-read on a fresh
-   connection (debounced) instead of trusting pushed head state.
+1. Phase 3 step 4 manual tests (drag-to-arrange; list in the step-4 commit).
 2. Phase 3 step 4: drag-to-arrange (position editing) on the canvas.
 3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
    docs/hyprland-persistence.md), which also replaces kanshi.

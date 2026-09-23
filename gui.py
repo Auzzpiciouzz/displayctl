@@ -57,6 +57,9 @@ WATCHDOG_EXTRA_SECONDS = 15
 # After a revert verifies OK, check again this much later: turning outputs
 # on/off can make Hyprland re-apply its config rules a moment afterwards.
 REVERIFY_SECONDS = 2
+# After a pushed update, wait this long after the LAST push (bursts come in
+# several wakeups) before re-reading the state on a fresh connection.
+RESYNC_DELAY_MS = 300
 
 ROTATION_NAMES = {0: "Normal", 1: "90°", 2: "180°", 3: "270°", 4: "Flipped",
                   5: "Flipped, 90°", 6: "Flipped, 180°", 7: "Flipped, 270°"}
@@ -132,13 +135,12 @@ class WaylandSource:
             self.source_id = None
             return GLib.SOURCE_REMOVE
         if self.om.done_count == dones_before:
-            # Something changed but no 'done' came with it. The protocol
-            # says the compositor must send 'done' to every client after a
-            # batch of changes; Hyprland 0.56.2 only sends it to the client
-            # that applied the change. This connection only carries
-            # output-management events, and Hyprland sends a change as one
-            # burst that we just dispatched in full, so refresh now.
-            log.debug("state changed without a 'done' event; refreshing anyway")
+            # The protocol says 'done' follows every batch of changes;
+            # Hyprland 0.56.2 only sends it to the client that applied.
+            log.debug("pushed update without a 'done' event")
+        # Treat the push only as "something changed": on Hyprland the pushed
+        # head state can be one change behind. The window re-reads the real
+        # state on a fresh connection (see MainWindow.schedule_resync).
         self.on_changed()
         return GLib.SOURCE_CONTINUE  # keep watching
 
@@ -731,9 +733,32 @@ class MainWindow(Adw.ApplicationWindow):
         return layout.effective(self.om.heads, self.pending)
 
     def set_om(self, om):
-        """Switch to a new connection (after a watchdog handover)."""
+        """Switch to a new connection (after a reconnect)."""
         self.om = om
         self.refresh()
+
+    def schedule_resync(self):
+        """A push arrived: (re)start the timer; re-read once the pushes stop.
+
+        Every push restarts the timer, so a burst of pushes causes one
+        fresh read, RESYNC_DELAY_MS after the last of them.
+        """
+        if getattr(self, "_resync_id", None):
+            GLib.source_remove(self._resync_id)
+        self._resync_id = GLib.timeout_add(RESYNC_DELAY_MS, self._resync)
+
+    def _resync(self):
+        self._resync_id = None
+        log.debug("pushed state: %s", describe_heads(self.om.heads))
+        try:
+            fresh = backend.read_states()
+        except WaylandError as e:
+            log.debug("fresh read failed: %s", e)
+            return GLib.SOURCE_REMOVE
+        self.om.sync_from(fresh)
+        log.debug("fresh read:   %s", describe_heads(self.om.heads))
+        self.refresh()
+        return GLib.SOURCE_REMOVE
 
     def refresh(self):
         """The live state changed (or we changed pending): update everything."""
@@ -837,7 +862,7 @@ class DisplayctlApp(Adw.Application):
         self.window.present()
 
     def _watch(self, om):
-        self.source = WaylandSource(om, self.window.show_error, self.window.refresh)
+        self.source = WaylandSource(om, self.window.show_error, self.window.schedule_resync)
 
     def _disconnect(self):
         self.source.stop()
