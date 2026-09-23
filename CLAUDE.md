@@ -78,10 +78,9 @@ GTK); gui.py handles edits from GLib.idle_add.
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and blocks other tools),
   and don't use nwg-displays alongside (it's another output-management tool).
-1. Manual drag-to-arrange tests 2–8 (list in commit 1d67d92's message; test 1
-   done). In test 5, after turning eDP-1 off again, check that DP-3 moves
-   back to 0,0 (in-memory check says it should: the layout is normalised
-   so it starts at 0,0).
+1. DONE 2026-09-23: drag-to-arrange tests 2–8 passed live on the real GUI
+   (tests/gui_live_arrange.py, 41/41 checks + SIGINT test; DP-3 returns to
+   0,0 when eDP-1 is turned off; 15 s timeout measured 15.006 s).
 2. Make "Keep" durable: write the kept layout to our own monitors.lua
    (design in docs/hyprland-persistence.md: protocol = preview,
    monitors.lua = keep; our file is ~/.config/hypr/displayctl/monitors.lua,
