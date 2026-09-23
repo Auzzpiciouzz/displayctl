@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""displayctl GUI, Phase 3 step 1: a READ-ONLY view of the monitor layout.
+"""displayctl GUI, Phase 3 step 3: edit display settings and apply them safely.
 
-A canvas draws every enabled monitor as a rectangle at its real position and
-relative size (disabled ones dimmed, off to the right). Clicking one shows its details in the side panel. Nothing is
-ever applied from here yet.
+A canvas draws every monitor to scale (disabled ones dimmed, off to the
+right). Select one to edit its settings in the side panel: "Use this
+display", resolution, refresh rate, scale and rotation. Edits stay PENDING:
+the canvas previews them, and nothing touches the real displays until you
+press Apply. Reset throws the pending edits away. (Moving monitors comes in
+step 4.)
 
 How Wayland and GTK share one thread
 ------------------------------------
@@ -12,16 +15,21 @@ a file descriptor becoming readable) and then calls the matching callback.
 Our Wayland connection is just a socket (a file descriptor). So instead of a
 second thread, we ask GLib to watch that fd and call us when the compositor
 has sent something. We then read and dispatch the events, which runs the
-same handlers as in the CLI (backend.OutputManager). When a 'done' event
-arrives, the state is consistent and we redraw.
+same handlers as in the CLI (backend.OutputManager), and redraw.
 
-We keep ONE output-management connection for the whole lifetime of the
-window: it's the connection that will later apply changes, and on Hyprland
-only the connection that applied a change can revert it (see
-docs/hyprland-persistence.md).
+What Apply does (see Applier)
+-----------------------------
+  hyprctl cross-check -> snapshot -> arm watchdog -> apply the FULL layout
+  through our own connection -> verify -> "Keep these display settings?"
+  (15 s; Esc and the timeout both revert).
+  Keep:   the watchdog stands down.
+  Revert: we revert through our OWN connection (on Hyprland only the client
+          that applied a change can revert it while it's connected), then
+          verify. The watchdog is only the fallback if the GUI crashes.
 """
 
 import logging
+import select
 import sys
 
 import gi
@@ -31,13 +39,31 @@ gi.require_version("Adw", "1")
 gi.require_version("PangoCairo", "1.0")
 from gi.repository import Adw, GLib, GLibUnix, Gtk, Pango, PangoCairo  # noqa: E402
 
-from backend import TRANSFORMS, OutputManager, WaylandError  # noqa: E402
+# Imported as modules (backend.x, safety.x) rather than names, so the test
+# harness can swap in fakes and exercise Apply without touching the displays.
+import backend  # noqa: E402
+import layout  # noqa: E402
+import safety  # noqa: E402
+from backend import OutputManager, WaylandError  # noqa: E402
 
 APP_ID = "dev.displayctl.App"
+PADDING = 56  # empty space (px) around the layout on the canvas
+CONFIRM_SECONDS = 15  # the "Keep these display settings?" countdown
+# The watchdog must not act while the GUI is still deciding or reverting:
+# its deadline is CONFIRM_SECONDS + this (+ its own grace period).
+WATCHDOG_EXTRA_SECONDS = 15
 
-# `gui.py --debug` logs every fd wakeup, 'done' event and redraw to stderr.
+ROTATION_NAMES = {0: "Normal", 1: "90°", 2: "180°", 3: "270°", 4: "Flipped",
+                  5: "Flipped, 90°", 6: "Flipped, 180°", 7: "Flipped, 270°"}
+
+# `gui.py --debug` logs fd wakeups, refreshes, redraws and the apply steps.
 # (Add WAYLAND_DEBUG=1 for libwayland's per-message trace as well.)
 log = logging.getLogger("displayctl.gui")
+
+
+def format_hz(refresh_mhz, decimals=3):
+    """144000 -> '144', 143999 -> '143.999' (the protocol sends milli-Hertz)."""
+    return f"{refresh_mhz / 1000:.{decimals}f}".rstrip("0").rstrip(".")
 
 
 def describe_heads(heads):
@@ -49,12 +75,6 @@ def describe_heads(heads):
         parts.append(f"{h.name}:{'on' if h.enabled else 'off'} {mode} "
                      f"pos {h.position[0]},{h.position[1]}")
     return " | ".join(parts)
-PADDING = 56  # empty space (px) around the layout on the canvas
-
-
-def format_hz(refresh_mhz, decimals=3):
-    """144000 -> '144', 143999 -> '143.999' (the protocol sends milli-Hertz)."""
-    return f"{refresh_mhz / 1000:.{decimals}f}".rstrip("0").rstrip(".")
 
 
 # --- Wayland <-> GLib glue -------------------------------------------------------
@@ -66,7 +86,7 @@ class WaylandSource:
     GLib calls _on_fd whenever the connection's fd is readable. The steps
     there are libwayland's standard non-blocking pattern:
       read()      prepare_read + read_events: move bytes from the socket
-                  into libwayland's event queue (won't block: fd is readable)
+                  into libwayland's event queue
       dispatch()  dispatch_pending: run our Python handlers for queued events
       flush()     send any requests we queued in those handlers
     """
@@ -94,7 +114,12 @@ class WaylandSource:
             return GLib.SOURCE_REMOVE  # stop watching a dead fd
         dones_before = self.om.done_count
         try:
-            self.om.display.read()
+            # Apply runs roundtrips synchronously on this same connection, and
+            # they can consume the data GLib saw as "readable" before we get
+            # here. read() would then block the whole UI waiting for more, so
+            # check again, without waiting (timeout 0), that data is there.
+            if select.select([fd], [], [], 0)[0]:
+                self.om.display.read()
             self.om.display.dispatch()
             self.om.display.flush()
         except RuntimeError as e:
@@ -109,7 +134,7 @@ class WaylandSource:
             # output-management events, and Hyprland sends a change as one
             # burst that we just dispatched in full, so refresh now.
             log.debug("state changed without a 'done' event; refreshing anyway")
-            self.on_changed()
+        self.on_changed()
         return GLib.SOURCE_CONTINUE  # keep watching
 
     def stop(self):
@@ -122,17 +147,17 @@ class WaylandSource:
 
 
 class LayoutCanvas(Gtk.DrawingArea):
-    """Draws monitors to scale; click one to select it.
+    """Draws the EFFECTIVE layout (live state + pending edits); click to select.
 
-    Enabled monitors sit at their real position. Disabled ones have no
-    position in the layout, so they're drawn dimmed with a dashed border in
-    a row to the right, at their preferred mode's size.
+    Enabled monitors sit at their position. Disabled ones have no position
+    in the layout, so they're drawn dimmed with a dashed border in a row to
+    the right, at their preferred mode's size. Monitors with pending edits
+    get a "Not applied" line.
     """
 
-    def __init__(self, om, on_select):
+    def __init__(self, window):
         super().__init__(hexpand=True, vexpand=True)
-        self.om = om
-        self.on_select = on_select
+        self.window = window  # gives us heads, effective states, pending
         self.selected = None  # name of the selected head, or None
         self._hit_boxes = []  # (name, x, y, w, h) in widget pixels, from the last draw
 
@@ -148,41 +173,43 @@ class LayoutCanvas(Gtk.DrawingArea):
         style.connect("notify::accent-color-rgba", lambda *_: self.queue_draw())
 
     def _layout_boxes(self):
-        """(head, x, y, w, h, enabled) for every head, in compositor units."""
+        """(head, state, x, y, w, h) for every head, in compositor units."""
+        states = self.window.effective()
         boxes = []
-        on = [h for h in self.om.heads if h.enabled and h.current_mode is not None]
-        for head in on:
-            w, h = head.logical_size()
-            boxes.append((head, head.position[0], head.position[1], w, h, True))
+        for head in self.window.om.heads:
+            s = states[head.name]
+            if s["enabled"] and s["mode"]:
+                w, h = layout.logical_size(s)
+                boxes.append((head, s, s["position"][0], s["position"][1], w, h))
 
         # Disabled heads: a row starting one "gap" to the right of the layout.
-        right = max((b[1] + b[3] for b in boxes), default=0)
-        top = min((b[2] for b in boxes), default=0)
+        right = max((b[2] + b[4] for b in boxes), default=0)
+        top = min((b[3] for b in boxes), default=0)
         gap = max(right // 12, 200)  # spacing, scaled to the layout
         x = right + gap if boxes else 0
-        for head in self.om.heads:
-            if head in on:
+        for head in self.window.om.heads:
+            s = states[head.name]
+            if s["enabled"] and s["mode"]:
                 continue
             mode = head.preferred_mode()
             if mode is None:
                 continue  # nothing to size it by
-            boxes.append((head, x, top, mode.width, mode.height, False))
+            boxes.append((head, s, x, top, mode.width, mode.height))
             x += mode.width + gap
         return boxes
 
     def _draw(self, area, cr, width, height):
         boxes = self._layout_boxes()
-        log.debug("redraw %dx%d: %s", width, height, describe_heads(self.om.heads))
+        log.debug("redraw %dx%d, pending: %s", width, height, sorted(self.window.pending))
         self._hit_boxes = []
         if not boxes:
             return
 
-        # 1. Bounding box of everything we draw, in compositor coordinates
-        #    (logical size = pixels / scale, swapped when rotated).
-        left = min(b[1] for b in boxes)
-        top = min(b[2] for b in boxes)
-        right = max(b[1] + b[3] for b in boxes)
-        bottom = max(b[2] + b[4] for b in boxes)
+        # 1. Bounding box of everything we draw, in compositor coordinates.
+        left = min(b[2] for b in boxes)
+        top = min(b[3] for b in boxes)
+        right = max(b[2] + b[4] for b in boxes)
+        bottom = max(b[3] + b[5] for b in boxes)
 
         # 2. One scale factor for both axes keeps the real proportions;
         #    then centre the layout in the widget, with padding all round.
@@ -194,7 +221,8 @@ class LayoutCanvas(Gtk.DrawingArea):
         fg = self.get_color()  # the theme's text colour (light or dark)
         accent = Adw.StyleManager.get_default().get_accent_color_rgba()
 
-        for head, x, y, w, h, enabled in boxes:
+        for head, state, x, y, w, h in boxes:
+            enabled = state["enabled"]
             sx = offset_x + (x - left) * factor
             sy = offset_y + (y - top) * factor
             # A small gap so touching monitors stay visually separate.
@@ -223,29 +251,37 @@ class LayoutCanvas(Gtk.DrawingArea):
             cr.stroke()
             cr.set_dash([])
 
-            self._draw_label(cr, head, enabled, rect, fg, dim)
+            self._draw_label(cr, head, state, rect, fg, accent, dim)
 
-    def _draw_label(self, cr, head, enabled, rect, fg, dim):
-        """Name (large, bold) and mode or "Disabled", centred in `rect`."""
-        if enabled:
-            m = head.current_mode
-            detail = f"{m.width}×{m.height} @ {format_hz(m.refresh_mhz, 2)} Hz"
+    def _draw_label(self, cr, head, state, rect, fg, accent, dim):
+        """Name (large, bold), mode or "Disabled", and "Not applied" if pending."""
+        if state["enabled"] and state["mode"]:
+            m = state["mode"]
+            detail = f"{m['width']}×{m['height']} @ {format_hz(m['refresh_mhz'], 2)} Hz"
+            if abs(state["scale"] - 1) > 1e-6:
+                detail += f" · {state['scale'] * 100:g}%"
         else:
             detail = "Disabled"
         name = GLib.markup_escape_text(head.name)
-        layout = self.create_pango_layout(None)
-        layout.set_alignment(Pango.Alignment.CENTER)
+        pending = head.name in self.window.pending
+        accent_hex = "#{:02x}{:02x}{:02x}".format(
+            int(accent.red * 255), int(accent.green * 255), int(accent.blue * 255))
+        layout_ = self.create_pango_layout(None)
+        layout_.set_alignment(Pango.Alignment.CENTER)
         # Try big labels first; shrink until they fit inside the rectangle.
         for name_size, detail_size in ((180, 125), (140, 110), (100, 90)):
-            layout.set_markup(
-                f'<span size="{name_size}%" weight="bold">{name}</span>\n'
-                f'<span size="{detail_size}%">{GLib.markup_escape_text(detail)}</span>', -1)
-            text_w, text_h = layout.get_pixel_size()
+            markup = (f'<span size="{name_size}%" weight="bold">{name}</span>\n'
+                      f'<span size="{detail_size}%">{GLib.markup_escape_text(detail)}</span>')
+            if pending:
+                markup += (f'\n<span size="{detail_size}%" weight="bold" '
+                           f'foreground="{accent_hex}">Not applied</span>')
+            layout_.set_markup(markup, -1)
+            text_w, text_h = layout_.get_pixel_size()
             if text_w <= rect[2] - 12 and text_h <= rect[3] - 12:
                 break
         cr.set_source_rgba(fg.red, fg.green, fg.blue, dim)
         cr.move_to(rect[0] + (rect[2] - text_w) / 2, rect[1] + (rect[3] - text_h) / 2)
-        PangoCairo.show_layout(cr, layout)
+        PangoCairo.show_layout(cr, layout_)
 
     def _on_click(self, gesture, n_press, x, y):
         clicked = None
@@ -254,85 +290,367 @@ class LayoutCanvas(Gtk.DrawingArea):
                 clicked = name
                 break
         self.selected = clicked  # clicking empty space clears the selection
-        self.queue_draw()
-        self.on_select(clicked)
+        self.window.on_select(clicked)
 
 
 # --- The details panel -----------------------------------------------------------
 
 
 class DetailsPanel(Gtk.Stack):
-    """Side panel: a placeholder, or the selected monitor's details.
+    """Side panel: a placeholder, or the selected monitor's settings + identity.
 
-    Top: the settings (what later becomes editable). Below: "About this
-    display", the fixed identity of the hardware.
+    The settings rows are editable. Changing one calls
+    window.on_edit(name, what, value); the window turns that into a pending
+    edit and calls show() again. While show() fills the rows, their change
+    signals must be ignored (self._filling), or filling a dropdown would
+    count as the user picking something.
     """
 
-    SETTINGS = [
-        ("Status", "status"), ("Resolution", "resolution"), ("Refresh rate", "refresh"),
-        ("Scale", "scale"), ("Position", "position"), ("Rotation", "transform"),
-    ]
     ABOUT = [
         ("Connector", "name"), ("Make", "make"), ("Model", "model"),
         ("Serial number", "serial"), ("Physical size", "physical"),
     ]
 
-    def __init__(self):
+    def __init__(self, window):
         # hexpand=False explicitly: otherwise the page inside would make the
         # panel grab most of the window's width from the canvas.
-        super().__init__(width_request=340, hexpand=False)
+        super().__init__(width_request=360, hexpand=False)
+        self.window = window
+        self._filling = False
+        self._name = None  # head currently shown
+        self._choices = {}  # dropdown key -> list of values behind its items
 
         placeholder = Adw.StatusPage(
             icon_name="video-display-symbolic",
             title="No monitor selected",
-            description="Click a monitor to see its details.",
+            description="Click a monitor to change its settings.",
         )
         placeholder.add_css_class("compact")
         self.add_named(placeholder, "empty")
 
-        self.rows = {}
         page = Adw.PreferencesPage()
-        self.settings_group = self._group(page, "Settings", self.SETTINGS)
-        self._group(page, "About this display", self.ABOUT)
-        self.add_named(page, "details")
 
-    def _group(self, page, title, fields):
-        group = Adw.PreferencesGroup(title=title)
-        for label, key in fields:
-            # "property" style: small title above a prominent value
-            # (the subtitle), which wraps cleanly when it's long.
+        # Settings (editable)
+        self.settings = Adw.PreferencesGroup()
+        self.use_row = Adw.SwitchRow(title="Use this display")
+        self.use_row.connect("notify::active", self._on_use)
+        self.settings.add(self.use_row)
+        self.combos = {}
+        for key, title in (("resolution", "Resolution"), ("refresh", "Refresh rate"),
+                           ("scale", "Scale"), ("rotation", "Rotation")):
+            row = Adw.ComboRow(title=title, model=Gtk.StringList())
+            row.connect("notify::selected", self._on_combo, key)
+            self.settings.add(row)
+            self.combos[key] = row
+        self.position_row = Adw.ActionRow(title="Position", subtitle_selectable=True)
+        self.position_row.add_css_class("property")
+        self.settings.add(self.position_row)
+        page.add(self.settings)
+
+        # About this display (fixed identity)
+        about = Adw.PreferencesGroup(title="About this display")
+        self.about_rows = {}
+        for label, key in self.ABOUT:
+            # "property" style: small title above a prominent value.
             row = Adw.ActionRow(title=label, subtitle_selectable=True)
             row.add_css_class("property")
-            group.add(row)
-            self.rows[key] = row
-        page.add(group)
-        return group
+            about.add(row)
+            self.about_rows[key] = row
+        page.add(about)
+        self.add_named(page, "details")
 
-    def show_head(self, head):
+    # --- filling the rows from a state ---
+
+    def show(self, head, state, pending):
         if head is None:
+            self._name = None
             self.set_visible_child_name("empty")
             return
-        # The settings group is headed by the connector name, e.g. "DP-3".
-        self.settings_group.set_title(GLib.markup_escape_text(head.name))
-        mode = head.current_mode if head.enabled else None
-        off = "—"
+        self._name = head.name
+        self._filling = True
+        try:
+            self._fill(head, state, pending)
+        finally:
+            self._filling = False
+        self.set_visible_child_name("details")
+
+    def _set_choices(self, key, values, labels, current):
+        """Fill a dropdown and select `current` (or nothing if it's absent)."""
+        row = self.combos[key]
+        # Only replace the list when it actually changed: rebuilding a
+        # dropdown's model is what the user would see as flicker.
+        if self._choices.get(key) != values:
+            row.set_model(Gtk.StringList.new(labels))
+            self._choices[key] = values
+        row.set_selected(values.index(current) if current in values else Gtk.INVALID_LIST_POSITION)
+
+    def _fill(self, head, state, pending):
+        title = GLib.markup_escape_text(head.name)
+        self.settings.set_title(title + (" · not applied" if pending else ""))
+        on = state["enabled"] and state["mode"] is not None
+        self.use_row.set_active(state["enabled"])
+
+        if on:
+            m = state["mode"]
+            sizes = layout.resolutions(head)
+            self._set_choices("resolution", sizes, [f"{w} × {h}" for w, h in sizes],
+                              (m["width"], m["height"]))
+            rates = layout.refresh_rates(head, m["width"], m["height"])
+            self._set_choices("refresh", rates, [f"{format_hz(r)} Hz" for r in rates],
+                              m["refresh_mhz"])
+            scales = layout.scales_for(state)
+            current_scale = min(scales, key=lambda s: abs(s - state["scale"]))
+            self._set_choices("scale", scales, [f"{s * 100:g}%" for s in scales], current_scale)
+            rots = layout.rotations_for(state)
+            self._set_choices("rotation", rots, [ROTATION_NAMES[r] for r in rots],
+                              state["transform"])
+            self.position_row.set_subtitle(f"{state['position'][0]}, {state['position'][1]}")
+        else:
+            for key in self.combos:
+                self._set_choices(key, [], [], None)
+            self.position_row.set_subtitle("—")
+        for row in list(self.combos.values()) + [self.position_row]:
+            row.set_sensitive(on)
+
         values = {
-            "status": "Enabled" if head.enabled else "Disabled",
-            "resolution": f"{mode.width} × {mode.height}" if mode else off,
-            "refresh": f"{format_hz(mode.refresh_mhz)} Hz" if mode else off,
-            "scale": f"{head.scale:g}" if head.enabled else off,
-            "position": f"{head.position[0]}, {head.position[1]}" if head.enabled else off,
-            "transform": TRANSFORMS.get(head.transform, str(head.transform)) if head.enabled else off,
             "name": head.name,
-            "make": head.make or off,
-            "model": head.model or off,
+            "make": head.make or "—",
+            "model": head.model or "—",
             "serial": head.serial or "(none)",
             "physical": f"{head.physical_size[0]} × {head.physical_size[1]} mm",
         }
         for key, text in values.items():
             # Subtitles are Pango markup: escape so "&" etc. show literally.
-            self.rows[key].set_subtitle(GLib.markup_escape_text(text))
-        self.set_visible_child_name("details")
+            self.about_rows[key].set_subtitle(GLib.markup_escape_text(text))
+
+    # --- user edits ---
+    #
+    # The edit is handled from GLib.idle_add, i.e. just AFTER this signal
+    # handler returns. Handling it right here would refill the rows (show())
+    # while GTK is still inside this row's own "selected changed" signal;
+    # replacing a dropdown's model from inside its own signal hung GTK.
+
+    def _edit_later(self, what, value):
+        name = self._name
+
+        def run():
+            self.window.on_edit(name, what, value)
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(run)
+
+    def _on_use(self, row, _pspec):
+        if not self._filling and self._name:
+            self._edit_later("enabled", row.get_active())
+
+    def _on_combo(self, row, _pspec, key):
+        if self._filling or not self._name:
+            return
+        index = row.get_selected()
+        values = self._choices.get(key, [])
+        if 0 <= index < len(values):
+            self._edit_later(key, values[index])
+
+
+# --- Applying -------------------------------------------------------------------------
+
+
+class Applier:
+    """Runs one Apply: checks, snapshot, watchdog, apply, verify, keep/revert.
+
+    The steps that wait (settling before verify, the 15 s countdown) are GLib
+    timeouts, so the window stays responsive. `busy` is True from Apply
+    until the change is kept or reverted; the window disables editing then.
+    """
+
+    def __init__(self, window):
+        self.window = window
+        self.busy = False
+        self.watchdog = None
+        self.snapshot = None
+        self.desired = None
+        self.dialog = None
+        self._countdown_id = None
+        self._decided = False
+
+    @property
+    def om(self):
+        return self.window.om
+
+    def start(self):
+        states = self.window.effective()
+
+        # Guards: a sane layout, and the protocol agreeing with hyprctl.
+        problems = layout.validate(states)
+        if problems:
+            self.window.alert("Can't apply these settings", "\n".join(problems))
+            return
+        disagreements = backend.hyprland_disagreements(self.om.heads)
+        if disagreements:
+            self.window.alert(
+                "Refusing to apply",
+                "The compositor's two views of your displays disagree, so it's not "
+                "safe to guess the current state:\n\n• " + "\n• ".join(disagreements)
+                + "\n\nNothing was changed.")
+            return
+        try:
+            lock = safety.take_lock()
+        except safety.LockBusy as e:
+            self.window.alert("Another change is in progress", f"{e}. Try again shortly.")
+            return
+
+        self.busy = True
+        self._decided = False
+        self.window.update_actions()
+        try:
+            # Snapshot, then arm the watchdog BEFORE applying.
+            self.snapshot = self.om.snapshot()
+            backend.save_json(backend.LAST_GOOD, self.snapshot)
+            self.watchdog = safety.start_watchdog(lock, CONFIRM_SECONDS + WATCHDOG_EXTRA_SECONDS)
+        except OSError as e:
+            self._finish()
+            self.window.alert("Can't apply", f"Couldn't save the snapshot or start the watchdog: {e}")
+            return
+        finally:
+            lock.close()  # the watchdog holds its own inherited copy of the lock
+        self.desired = states
+        log.debug("apply: %s", {n: layout.logical_size(s) for n, s in states.items()})
+
+        try:
+            result = self.om.run_configuration(states, "apply")
+        except WaylandError as e:
+            # Our connection is broken, so the watchdog's revert will work.
+            safety.tell(self.watchdog, "revert")
+            self._finish()
+            self.window.alert("Apply failed", f"{e}. The watchdog is restoring the previous settings.")
+            return
+        log.debug("apply result: %s", result)
+
+        if result == "cancelled":
+            safety.tell(self.watchdog, "keep")  # nothing was applied
+            self._finish()
+            self.window.alert("Apply was cancelled",
+                              "The displays changed while applying (monitor plugged or "
+                              "unplugged?). Nothing was changed. Check the layout and try again.")
+            return
+        if result == "failed":
+            # The compositor should have undone any partial change itself;
+            # restore the snapshot anyway, through our own connection.
+            self.window.toast("The compositor rejected these settings. Restoring…")
+            self._revert()
+            return
+
+        safety.tell(self.watchdog, "applied")
+        # Give the mode switch a moment, then check what really happened.
+        GLib.timeout_add(1000, self._verify_then_ask)
+
+    def _verify_then_ask(self):
+        problems, _ = backend.verify_state(self.desired, settle=0)
+        log.debug("verify after apply: %s", problems or "ok")
+        self._ask(problems)
+        return GLib.SOURCE_REMOVE
+
+    # --- the "Keep these display settings?" dialog ---
+
+    def _ask(self, problems):
+        self._remaining = CONFIRM_SECONDS
+        self._problems = problems
+        dialog = Adw.AlertDialog(heading="Keep these display settings?")
+        dialog.add_response("revert", "Revert")
+        dialog.add_response("keep", "Keep Changes")
+        dialog.set_response_appearance("keep", Adw.ResponseAppearance.SUGGESTED)
+        # Esc (the "close" response) and Enter both mean Revert: if the screen
+        # is unreadable, any blind key press must lead back to safety.
+        dialog.set_close_response("revert")
+        dialog.set_default_response("revert")
+        dialog.connect("response", self._on_response)
+        self.dialog = dialog
+        self._update_body()
+        dialog.present(self.window)
+        # timeout_add (milliseconds), not timeout_add_seconds: the latter
+        # rounds to whole seconds to save power, so the first tick can come
+        # early and "15 s" could end after ~14 s.
+        self._countdown_id = GLib.timeout_add(1000, self._tick)
+
+    def _update_body(self):
+        body = f"Reverting to the previous settings in {self._remaining} s."
+        if self._problems:
+            body += ("\n\nNote: the displays don't fully match what was requested:\n• "
+                     + "\n• ".join(self._problems))
+        if backend.on_hyprland():
+            body += "\n\nChanges last until Hyprland reloads its configuration."
+        self.dialog.set_body(body)
+
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self._countdown_id = None
+            self.dialog.force_close()  # closes without emitting "response"
+            self._decide(keep=False)
+            return GLib.SOURCE_REMOVE
+        self._update_body()
+        return GLib.SOURCE_CONTINUE
+
+    def _on_response(self, dialog, response):
+        self._decide(keep=(response == "keep"))
+
+    def _decide(self, keep):
+        if self._decided:  # timeout and a click can race; act only once
+            return
+        self._decided = True
+        if self._countdown_id is not None:
+            GLib.source_remove(self._countdown_id)
+            self._countdown_id = None
+        log.debug("decision: %s", "keep" if keep else "revert")
+        if keep:
+            safety.tell(self.watchdog, "keep")
+            self._finish()
+            self.window.clear_pending()
+            self.window.toast("Display settings kept")
+        else:
+            self._revert()
+
+    # --- reverting ---
+
+    def _revert(self):
+        """Restore the snapshot through OUR connection, then verify."""
+        desired = backend.desired_from_snapshot(self.snapshot)
+        try:
+            result = self.om.run_configuration(desired, "apply")
+        except WaylandError as e:
+            result = f"error: {e}"
+        log.debug("self-revert result: %s", result)
+        GLib.timeout_add(1000, self._verify_revert, desired)
+
+    def _verify_revert(self, desired):
+        problems, _ = backend.verify_state(desired, settle=0)
+        log.debug("verify after revert: %s", problems or "ok")
+        if not problems:
+            safety.tell(self.watchdog, "keep")  # already restored: nothing left to do
+            self._finish()
+            self.window.clear_pending()
+            self.window.toast("Reverted to the previous settings")
+        else:
+            # Our revert didn't take. On Hyprland another client's revert is
+            # ignored while we're connected, so disconnect first, then let
+            # the watchdog restore the snapshot, then reconnect.
+            self.window.toast("Revert didn't take effect; handing over to the watchdog…")
+            self.window.app.handover_to_watchdog(self.watchdog, self._after_handover)
+        return GLib.SOURCE_REMOVE
+
+    def _after_handover(self, exit_code):
+        self._finish()
+        self.window.clear_pending()
+        if exit_code == 0:
+            self.window.toast("The watchdog restored the previous settings")
+        else:
+            self.window.alert("Revert failed",
+                              f"Neither the GUI nor the watchdog could restore the previous "
+                              f"settings. See {safety.WATCHDOG_LOG}.\nSnapshot: {backend.LAST_GOOD}")
+
+    def _finish(self):
+        self.busy = False
+        self.dialog = None
+        self.window.update_actions()
 
 
 # --- Window and application ---------------------------------------------------------
@@ -340,14 +658,25 @@ class DetailsPanel(Gtk.Stack):
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app, om):
-        super().__init__(application=app, title="Displays", default_width=1000, default_height=600)
+        super().__init__(application=app, title="Displays", default_width=1100, default_height=680)
+        self.app = app
         self.om = om
+        self.pending = {}  # {head name: state}, see layout.py
+        self.applier = Applier(self)
 
         self.window_title = Adw.WindowTitle(title="Displays")
         header = Adw.HeaderBar(title_widget=self.window_title)
+        self.reset_button = Gtk.Button(label="Reset")
+        self.reset_button.set_tooltip_text("Discard the changes you haven't applied")
+        self.reset_button.connect("clicked", lambda *_: self.clear_pending())
+        header.pack_start(self.reset_button)
+        self.apply_button = Gtk.Button(label="Apply")
+        self.apply_button.add_css_class("suggested-action")
+        self.apply_button.connect("clicked", lambda *_: self.applier.start())
+        header.pack_end(self.apply_button)
 
-        self.canvas = LayoutCanvas(om, self._on_select)
-        self.details = DetailsPanel()
+        self.canvas = LayoutCanvas(self)
+        self.details = DetailsPanel(self)
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         body.append(self.canvas)
@@ -361,26 +690,94 @@ class MainWindow(Adw.ApplicationWindow):
 
         view = Adw.ToolbarView(content=content)
         view.add_top_bar(header)
-        self.set_content(view)
+        self.toasts = Adw.ToastOverlay(child=view)
+        self.set_content(self.toasts)
 
-        # Every 'done' event = a new consistent state: refresh everything.
-        om.listeners.append(self.refresh)
         self.refresh()
 
-    def _on_select(self, name):
-        self.details.show_head(self.om.head(name) if name else None)
+    # --- state ---
+
+    def effective(self):
+        return layout.effective(self.om.heads, self.pending)
+
+    def set_om(self, om):
+        """Switch to a new connection (after a watchdog handover)."""
+        self.om = om
+        self.refresh()
 
     def refresh(self):
+        """The live state changed (or we changed pending): update everything."""
         log.debug("refresh (last done serial %s): %s", self.om.serial, describe_heads(self.om.heads))
-        enabled = sum(1 for h in self.om.heads if h.enabled)
-        disabled = len(self.om.heads) - enabled
-        self.window_title.set_subtitle(f"{enabled} enabled, {disabled} disabled · read-only")
-        # The selected monitor may have been unplugged.
-        head = self.om.head(self.canvas.selected) if self.canvas.selected else None
-        if head is None:
-            self.canvas.selected = None
-        self.details.show_head(head)
+        # Drop edits for unplugged monitors, and edits that now match reality.
+        self.pending = {
+            name: s for name, s in layout.prune(self.pending, self.om.heads).items()
+            if layout.differs(self.om.head(name), s)
+        }
+        states = self.effective()
+        on = layout.enabled_count(states)
+        subtitle = f"{on} enabled, {len(states) - on} disabled"
+        if self.pending:
+            subtitle += " · changes not applied"
+        self.window_title.set_subtitle(subtitle)
+
+        if self.canvas.selected and self.om.head(self.canvas.selected) is None:
+            self.canvas.selected = None  # it was unplugged
+        name = self.canvas.selected
+        head = self.om.head(name) if name else None
+        self.details.show(head, states[name] if head else None, name in self.pending)
+        self.update_actions()
         self.canvas.queue_draw()
+
+    def update_actions(self):
+        busy = self.applier.busy
+        self.apply_button.set_sensitive(bool(self.pending) and not busy)
+        self.reset_button.set_sensitive(bool(self.pending) and not busy)
+        self.details.set_sensitive(not busy)
+        self.canvas.set_sensitive(not busy)
+
+    def clear_pending(self):
+        self.pending = {}
+        self.refresh()
+
+    # --- user actions ---
+
+    def on_select(self, name):
+        self.refresh()
+
+    def on_edit(self, name, what, value):
+        head = self.om.head(name)
+        if head is None or self.applier.busy:
+            return
+        states = self.effective()
+        state = states[name]
+        try:
+            if what == "enabled":
+                state = layout.with_enabled(states, head, value)
+            elif what == "resolution":
+                state = layout.with_resolution(state, head, *value)
+            elif what == "refresh":
+                state = layout.with_refresh(state, head, value)
+            elif what == "scale":
+                state = layout.with_scale(state, value)
+            elif what == "rotation":
+                state = layout.with_transform(state, value)
+        except ValueError as e:  # includes layout.AllOutputsOff
+            self.toast(str(e))
+            self.refresh()  # put the control back to what it was
+            return
+        self.pending = layout.set_pending(self.pending, head, state)
+        log.debug("edit %s %s=%s -> pending %s", name, what, value, sorted(self.pending))
+        self.refresh()
+
+    # --- messages ---
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
+
+    def alert(self, heading, body):
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("ok", "OK")
+        dialog.present(self)
 
     def show_error(self, message):
         self.banner.set_title(message)
@@ -406,13 +803,42 @@ class DisplayctlApp(Adw.Application):
             self.quit()
             return
         self.window = MainWindow(self, self.om)
-        self.source = WaylandSource(self.om, self.window.show_error, self.window.refresh)
+        self._watch(self.om)
         self.window.present()
 
+    def _watch(self, om):
+        self.source = WaylandSource(om, self.window.show_error, self.window.refresh)
+
+    def handover_to_watchdog(self, watchdog, done):
+        """Disconnect, let the watchdog revert, reconnect, then done(exit_code).
+
+        Needed when our own revert didn't take: on Hyprland the watchdog's
+        revert only works once the applying client (us) has disconnected.
+        """
+        self.source.stop()
+        self.om.close()
+        safety.tell(watchdog, "revert")
+        waited = [0]
+
+        def poll():
+            code = watchdog.poll()
+            waited[0] += 1
+            if code is None and waited[0] < 120:  # up to 60 s
+                return GLib.SOURCE_CONTINUE
+            self.om = OutputManager()
+            self._watch(self.om)
+            self.window.set_om(self.om)
+            done(code if code is not None else 1)
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(500, poll)
+
     def _on_shutdown(self, app):
+        # Closing the window mid-countdown: our connection closes here, and
+        # the watchdog sees its pipe close when we exit, so it reverts.
         if self.source is not None:
             self.source.stop()
-        if self.om is not None:
+        if self.om is not None and self.om.display._ptr is not None:
             self.om.close()
 
 

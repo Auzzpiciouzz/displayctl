@@ -58,25 +58,23 @@ Python 3, PyGObject (GTK4 + libadwaita), pywayland.
 Backend protocol: wlr-output-management-unstable-v1
 (XML at /usr/share/wlr-protocols/unstable/). Venv: .venv (system site packages).
 Files: backend.py (Wayland), displayctl.py (CLI), watchdog.py (revert
-process), gui.py (GTK4 GUI; Wayland fd in the GLib main loop, one persistent
-connection, redraws on every 'done' or done-less update batch; `--debug`
-logs fd wakeups, refreshes and redraws).
+process), safety.py (lock + watchdog helpers, shared by CLI and GUI),
+layout.py (GUI edit logic, no GTK/Wayland; tests in tests/, run
+`.venv/bin/python -m unittest discover -s tests`), gui.py (GTK4 GUI; Wayland
+fd in the GLib main loop, one persistent connection that watches, applies
+and reverts; `--debug` logs fd wakeups, refreshes, redraws, apply steps).
+GTK gotcha: never rebuild a widget from inside its own change signal (hung
+GTK); gui.py handles edits from GLib.idle_add.
 
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and fights displayctl).
-1. Phase 3 step 2: drag-to-arrange on the canvas (still no applying), then
-   applying from the GUI with the 15 s keep/revert. Revert through the GUI's
-   OWN connection; watchdog only as crash fallback.
-2. GUI design notes (queued, from review of step 1):
-   - show disabled monitors as dimmed rectangles on the canvas
-   - more padding around the layout on the canvas
-   - bigger monitor labels
-   - details panel: settings (mode, refresh, scale, position, rotation) at
-     the top; identity (make, model, serial, physical size) in a lower
-     "About this display" section; drop the Description row
+1. Manual test of Phase 3 step 3 (GUI Apply on real displays) — the list is
+   in the step-3 commit message / session notes; not done yet.
+2. Phase 3 step 4: drag-to-arrange (position editing) on the canvas.
 3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
    docs/hyprland-persistence.md; open points listed there).
-4. Optional, later: startup-race test; report the test() side effect upstream.
+4. Optional, later: startup-race test; report Hyprland deviations upstream
+   (test() side effect, no 'done' for watchers, serials ignored).
 
 ## Rules
 - Never edit ~/.config/hypr/hyprland.lua; the app owns only its own monitors.lua

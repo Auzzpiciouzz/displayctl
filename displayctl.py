@@ -18,7 +18,6 @@ If this process crashes or hangs during step 5, the watchdog still reverts.
 """
 
 import argparse
-import fcntl
 import os
 import re
 import select
@@ -30,15 +29,15 @@ import tty
 from pathlib import Path
 
 from backend import (
-    CACHE_DIR, LAST_GOOD, TRANSFORM_BY_NAME, TRANSFORMS,
+    LAST_GOOD, TRANSFORM_BY_NAME, TRANSFORMS,
     OutputManager, WaylandError, desired_from_snapshot, hyprland_disagreements,
     on_hyprland, save_json, verify_state,
 )
+import safety
+from safety import WATCHDOG_LOG, LockBusy, start_watchdog, tell
 
 CONFIRM_SECONDS = 15
 HERE = Path(__file__).resolve().parent
-LOCK_FILE = CACHE_DIR / "lock"
-WATCHDOG_LOG = CACHE_DIR / "watchdog.log"
 
 # What each configuration result means, in plain words.
 RESULT_MESSAGES = {
@@ -174,46 +173,11 @@ def build_desired(om, args):
 
 
 def take_lock():
-    """Allow only one pending change at a time.
-
-    flock() holds the lock as long as the file stays open, in this process
-    or in any child that inherits the file descriptor (the watchdog does). So
-    a second `set` is refused until the watchdog has finished too.
-    """
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    lock = open(LOCK_FILE, "w")
+    """safety.take_lock, but a busy lock ends the CLI with a message."""
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        die("another display change is still pending (watchdog running); try again shortly")
-    return lock
-
-
-def start_watchdog(lock, confirm_seconds):
-    """Launch watchdog.py with a pipe to its stdin. Returns the Popen object."""
-    log = open(WATCHDOG_LOG, "a")
-    return subprocess.Popen(
-        [sys.executable, str(HERE / "watchdog.py"), str(LAST_GOOD), str(confirm_seconds)],
-        stdin=subprocess.PIPE,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        text=True,
-        # New session: Ctrl+C / closing the terminal only hits displayctl.py,
-        # not the watchdog that has to clean up after it.
-        start_new_session=True,
-        # Hand over the lock so it stays held until the watchdog is done.
-        pass_fds=(lock.fileno(),),
-        cwd=HERE,
-    )
-
-
-def tell(watchdog, command):
-    """Send one command line to the watchdog."""
-    try:
-        watchdog.stdin.write(command + "\n")
-        watchdog.stdin.flush()
-    except BrokenPipeError:
-        pass  # it already exited; its log says why
+        return safety.take_lock()
+    except LockBusy as e:
+        die(f"{e}; try again shortly")
 
 
 def wait_for_revert(watchdog):

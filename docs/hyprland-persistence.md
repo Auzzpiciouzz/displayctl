@@ -190,6 +190,14 @@ serial is fresh after dispatching), show the user the new layout, and let
 them retry. Don't retry automatically: the layout they edited may no longer
 make sense.
 
+### Known gap: a GUI that hangs (not crashes)
+
+If gui.py crashes or is closed, its connection closes and the watchdog's
+revert works. If it HANGS with the connection still open, the watchdog's
+revert is sent but ignored by Hyprland (only the applying client can revert
+while it's connected). Its verify then fails and it logs a loud error. A
+hang during the 15 s dialog is the remaining unprotected case.
+
 ## Phase 4 design: rule-based dock switching on Hyprland
 
 Goal: on Hyprland the config rules are the single source of truth for
