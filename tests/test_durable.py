@@ -54,7 +54,7 @@ def edp_off(rules):
 
 
 class U1Generated(unittest.TestCase):
-    """The generated Lua, run for real under each interpreter."""
+    """The generated Lua, run for real under each interpreter (first load)."""
 
     def each(self):
         self.assertTrue(INTERPRETERS, "no local Lua interpreter")
@@ -64,46 +64,46 @@ class U1Generated(unittest.TestCase):
 
     def test_a_docked_turns_panel_off_and_registers_handlers(self):
         for lua in self.each():
-            rules, handlers, _, _ = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua)
-            self.assertIn("mode=2560x1440@200.000 output=DP-3 position=0x0 scale=1 transform=0", rules)
-            self.assertTrue(edp_off(rules))
-            self.assertEqual(handlers, ["monitor.added", "monitor.removed"])
+            r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua)
+            self.assertIn("mode=2560x1440@200.000 output=DP-3 position=0x0 scale=1 transform=0", r.rules)
+            self.assertTrue(r.panel_disabled_at_load())
+            self.assertEqual(r.handlers, ["monitor.added", "monitor.removed"])
+            self.assertEqual((r.reloads, r.loads), (0, 1))   # stable: nothing to do
 
     def test_b_undocked_leaves_panel_on(self):
         for lua in self.each():
-            rules, _, _, _ = durable.run_mock(gen(docked_edp_off()), [], lua=lua)
-            self.assertFalse(edp_off(rules))
+            r = durable.run_mock(gen(docked_edp_off()), [], lua=lua)
+            self.assertFalse(r.panel_disabled_at_load())
+            self.assertTrue(r.panel_on)
 
     def test_c_other_external_leaves_panel_on(self):
         other = {"name": "DP-3", "description": "Dell Inc. U2720Q ABC123"}  # same port, other monitor
         for lua in self.each():
-            rules, _, _, _ = durable.run_mock(gen(docked_edp_off()), [other], lua=lua)
-            self.assertFalse(edp_off(rules))
+            self.assertFalse(durable.run_mock(gen(docked_edp_off()), [other], lua=lua).panel_disabled_at_load())
 
     def test_d_errors_and_junk_leave_panel_on(self):
         for lua in self.each():
             for bad in ("error", "nil", "junk", "destroyed"):
                 with self.subTest(case=bad):
-                    rules, _, _, _ = durable.run_mock(gen(docked_edp_off()), bad, lua=lua)
-                    self.assertFalse(edp_off(rules))
+                    r = durable.run_mock(gen(docked_edp_off()), bad, lua=lua)
+                    self.assertFalse(r.panel_disabled_at_load())
+                    self.assertTrue(r.panel_on)
 
     def test_e_panel_kept_on_gets_normal_rule_and_no_guard(self):
         for lua in self.each():
-            rules, handlers, _, _ = durable.run_mock(gen(both_on()), [DP3, EDP], lua=lua)
-            self.assertIn("mode=1920x1080@144.005 output=eDP-1 position=0x0 scale=1 transform=0", rules)
-            self.assertIn("mode=2560x1440@200.000 output=DP-3 position=1920x0 scale=1 transform=0", rules)
-            self.assertFalse(edp_off(rules))
-            self.assertEqual(handlers, [])
+            r = durable.run_mock(gen(both_on()), [DP3, EDP], lua=lua)
+            self.assertIn("mode=1920x1080@144.005 output=eDP-1 position=0x0 scale=1 transform=0", r.rules)
+            self.assertIn("mode=2560x1440@200.000 output=DP-3 position=1920x0 scale=1 transform=0", r.rules)
+            self.assertFalse(r.panel_disabled_at_load())
+            self.assertEqual(r.handlers, [])
 
     def test_f_awkward_descriptions_are_escaped_and_still_match(self):
         weird = 'Evil "Monitor" \\ with\nnewline\tand tab'
         mon = {"name": "DP-3", "description": weird}
         for lua in self.each():
             text = gen(docked_edp_off(), {"DP-3": weird, "eDP-1": BOE})
-            rules, _, _, _ = durable.run_mock(text, [mon], lua=lua)
-            self.assertTrue(edp_off(rules))
-            rules, _, _, _ = durable.run_mock(text, [DP3], lua=lua)   # real Samsung: no match
-            self.assertFalse(edp_off(rules))
+            self.assertTrue(durable.run_mock(text, [mon], lua=lua).panel_disabled_at_load())
+            self.assertFalse(durable.run_mock(text, [DP3], lua=lua).panel_disabled_at_load())
 
     def test_g_syntax_check_with_luac(self):
         luac = shutil.which("luac")
@@ -123,84 +123,137 @@ class U1Generated(unittest.TestCase):
     def test_h_external_off_is_plain_disable_and_panel_never_unguarded(self):
         layout = {"DP-3": state("DP-3", False), "eDP-1": state("eDP-1", True, 1920, 1080, 144005)}
         for lua in self.each():
-            rules, handlers, _, _ = durable.run_mock(gen(layout), [], lua=lua)
-            self.assertIn("disabled=true output=DP-3", rules)
-            self.assertFalse(edp_off(rules))
-            self.assertEqual(handlers, [])
-        # Across all layouts, "eDP-1 disabled" can only ever come from the guard.
+            r = durable.run_mock(gen(layout), [], lua=lua)
+            self.assertIn("disabled=true output=DP-3", r.rules)
+            self.assertFalse(r.panel_disabled_at_load())
+            self.assertEqual(r.handlers, [])
         for layout in (docked_edp_off(), both_on(), layout):
             self.assertNotIn('hl.monitor({ output = "eDP-1", disabled = true })', gen(layout))
 
     def test_scale_and_rotation_in_rules(self):
         layout = {"DP-3": state("DP-3", True, 2560, 1440, 143999, pos=(0, 0), scale=1.25, transform=1),
                   "eDP-1": state("eDP-1", False)}
-        rules, _, _, _ = durable.run_mock(gen(layout), [DP3], lua=INTERPRETERS[0])
-        self.assertIn("mode=2560x1440@143.999 output=DP-3 position=0x0 scale=1.25 transform=1", rules)
+        r = durable.run_mock(gen(layout), [DP3], lua=INTERPRETERS[0])
+        self.assertIn("mode=2560x1440@143.999 output=DP-3 position=0x0 scale=1.25 transform=1", r.rules)
 
 
-class U1Handlers(unittest.TestCase):
-    """Undock/dock re-check and reload-loop safety."""
+def undock(slow=0, **kw):
+    return durable.run_mock(gen(docked_edp_off()), [DP3], event={
+        "name": "monitor.removed", "monitor": DP3, "after": [], "at": 1, "slow": slow}, **kw)
 
-    def run_event(self, loaded_with, event, lua, **kw):
-        _, _, reloads, out = durable.run_mock(gen(docked_edp_off()), loaded_with, event=event,
-                                              lua=lua, **kw)
-        pending = int(next(l.split()[1] for l in out.splitlines() if l.startswith("TIMERS_PENDING")))
-        return reloads, pending
 
-    def test_i_undock_reloads_once(self):
+class U1Undock(unittest.TestCase):
+    """Undock/dock with a simulated clock. The live L11 failure: after the
+    unplug, hl.get_monitors still listed the Samsung for a while, the reload
+    saw it, and the panel was turned off again (black screen)."""
+
+    def test_i_undock_panel_on_at_once_even_with_a_stale_list(self):
         for lua in INTERPRETERS:
-            with self.subTest(lua=lua):
-                r, p = self.run_event([DP3], {"name": "monitor.removed", "monitor": DP3, "after": []}, lua)
-                self.assertEqual((r, p), (1, 0))
+            for slow in (0, 1, 3, 8, 20):
+                with self.subTest(lua=lua, slow=slow):
+                    r = undock(slow, lua=lua)
+                    self.assertTrue(r.panel_on)
+                    self.assertEqual(r.black, 0.0)          # on at the event itself
+                    self.assertGreaterEqual(r.direct, 1)
+                    self.assertLessEqual(r.reloads, 2)      # no loop
+                    self.assertEqual(r.pending, 0)          # everything settled
 
-    def test_j_dock_reloads_once(self):
+    def test_i2_direct_enable_ineffective_reload_still_rescues(self):
         for lua in INTERPRETERS:
-            with self.subTest(lua=lua):
-                r, _ = self.run_event([], {"name": "monitor.added", "monitor": DP3, "after": [DP3]}, lua)
-                self.assertEqual(r, 1)
+            for slow in (0, 3, 8):
+                with self.subTest(lua=lua, slow=slow):
+                    r = undock(slow, lua=lua, direct_works=False)
+                    self.assertTrue(r.panel_on)
+                    self.assertLessEqual(r.black, 1.5)      # rescued by the reload ~1 s later
+                    self.assertLessEqual(r.reloads, 2)
+
+    def test_i3_old_behaviour_would_have_failed(self):
+        # Sanity check of the model: with the "gone" memory disabled (as in the
+        # old file), a stale list makes the reload turn the panel off again.
+        text = gen(docked_edp_off()).replace("and not gone[desc]", "")
+        r = durable.run_mock(text, [DP3], event={"name": "monitor.removed", "monitor": DP3,
+                                                 "after": [], "at": 1, "slow": 3},
+                             lua=INTERPRETERS[0], direct_works=False)
+        self.assertGreater(r.black, 1.5)
+
+    def test_j_dock_turns_panel_off_again(self):
+        for lua in INTERPRETERS:
+            for slow in (0, 2):
+                with self.subTest(lua=lua, slow=slow):
+                    r = durable.run_mock(gen(docked_edp_off()), [], lua=lua, event={
+                        "name": "monitor.added", "monitor": DP3, "after": [DP3], "at": 1, "slow": slow})
+                    self.assertFalse(r.panel_on)            # docked layout again
+                    self.assertEqual(r.black, 0.0)
+                    self.assertLessEqual(r.reloads, 2)
 
     def test_k_panel_own_events_are_ignored(self):
         for lua in INTERPRETERS:
             for name in ("monitor.added", "monitor.removed"):
                 with self.subTest(lua=lua, event=name):
-                    r, p = self.run_event([DP3], {"name": name, "monitor": EDP, "after": [DP3]}, lua)
-                    self.assertEqual((r, p), (0, 0))
+                    r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, event={
+                        "name": name, "monitor": EDP, "after": [DP3], "at": 1})
+                    self.assertEqual((r.reloads, r.panel_on), (0, False))
 
     def test_l_no_change_no_reload(self):
-        # After a reload the answer equals what that load applied: an unrelated
-        # monitor coming while still docked must not reload (no loop).
         dell = {"name": "HDMI-A-1", "description": "Dell Inc. U2720Q ABC123"}
         for lua in INTERPRETERS:
             with self.subTest(lua=lua):
-                r, _ = self.run_event([DP3], {"name": "monitor.added", "monitor": dell,
-                                              "after": [DP3, dell]}, lua)
-                self.assertEqual(r, 0)
-                r, _ = self.run_event([], {"name": "monitor.added", "monitor": dell, "after": [dell]}, lua)
-                self.assertEqual(r, 0)   # undocked, still undocked: nothing to do
+                r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, event={
+                    "name": "monitor.added", "monitor": dell, "after": [DP3, dell], "at": 1})
+                self.assertEqual((r.reloads, r.loads), (0, 1))
+                r = durable.run_mock(gen(docked_edp_off()), [], lua=lua, event={
+                    "name": "monitor.added", "monitor": dell, "after": [dell], "at": 1})
+                self.assertEqual(r.reloads, 0)
 
-    def test_m_rate_limit_postpones_but_never_drops(self):
+    def test_m_rate_limit_postpones_but_panel_still_on_at_once(self):
         for lua in INTERPRETERS:
             with self.subTest(lua=lua):
-                ev = {"name": "monitor.removed", "monitor": DP3, "after": []}
-                r, p = self.run_event([DP3], ev, lua, stamp_age=1)   # reloaded 1 s ago
-                self.assertEqual(r, 0)
-                self.assertGreaterEqual(p, 1, "the check must stay scheduled")
-                r, _ = self.run_event([DP3], ev, lua, stamp_age=60)  # long ago: go
-                self.assertEqual(r, 1)
+                r = undock(3, lua=lua, stamp_age=1)     # a reload 1 s before the load
+                self.assertTrue(r.panel_on)
+                self.assertEqual(r.black, 0.0)          # the direct enable doesn't wait
+                self.assertTrue(r.reload_at and min(r.reload_at) >= 4.0, r.reload_at)
 
-    def test_n_without_timers_checks_immediately(self):
+    def test_n_without_timers(self):
+        for lua in INTERPRETERS:
+            for slow in (0, 3):
+                with self.subTest(lua=lua, slow=slow):
+                    r = undock(slow, lua=lua, timers=False)
+                    self.assertTrue(r.panel_on)
+                    self.assertEqual(r.black, 0.0)
+
+    def test_o_unidentifiable_removed_monitor_turns_panel_on(self):
         for lua in INTERPRETERS:
             with self.subTest(lua=lua):
-                r, _ = self.run_event([DP3], {"name": "monitor.removed", "monitor": DP3, "after": []},
-                                      lua, timers=False)
-                self.assertEqual(r, 1)
+                r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, event={
+                    "name": "monitor.removed", "monitor": "destroyed", "after": [], "at": 1, "slow": 3})
+                self.assertTrue(r.panel_on)
+                self.assertEqual(r.black, 0.0)
 
-    def test_o_destroyed_event_object_is_handled(self):
+    def test_p_never_zero_screens_even_without_an_event(self):
+        # The monitor vanishes and NO event arrives: the check after the load
+        # sees no real monitor on and turns the panel on.
         for lua in INTERPRETERS:
             with self.subTest(lua=lua):
-                r, _ = self.run_event([DP3], {"name": "monitor.removed", "monitor": "destroyed",
-                                              "after": []}, lua)
-                self.assertEqual(r, 1)   # treated as external, re-checked, undocked -> reload
+                r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, event={
+                    "name": "monitor.silent", "monitor": DP3, "after": [], "at": 1})
+                self.assertTrue(r.panel_on)
+                self.assertLessEqual(r.black, 1.6)
+
+    def test_q_gone_memory_expires_and_is_cleared_on_replug(self):
+        lua = INTERPRETERS[0]
+        self.assertTrue(durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua,
+                                         gone={SAMSUNG: 40}).panel_disabled_at_load())   # expired
+        r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, gone={SAMSUNG: 5})
+        self.assertFalse(r.panel_disabled_at_load())                                   # still gone
+        r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, gone={SAMSUNG: 5}, event={
+            "name": "monitor.added", "monitor": DP3, "after": [DP3], "at": 1})
+        self.assertFalse(r.panel_on)            # replug clears it -> docked layout again
+
+    def test_r_log_records_loads_events_and_decisions(self):
+        r = undock(3, lua=INTERPRETERS[0])
+        for needle in ("load: monitors", "event monitor.removed DP-3", "ON directly",
+                       "check (1 s after removal)", "reload (", "-> panel on"):
+            self.assertIn(needle, r.log)
 
 
 class U2Files(unittest.TestCase):

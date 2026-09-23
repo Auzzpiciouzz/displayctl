@@ -105,13 +105,51 @@ def generate_lua(states, descriptions, now=None):
     return "\n".join(lines) + "\n"
 
 
-# The guarded panel-off rule plus the undock/dock re-check. Plain Lua that
-# runs on 5.1-5.5 and LuaJIT; every call into Hyprland is inside pcall.
-GUARD_TEMPLATE = r'''-- 3. Laptop panel(s) OFF only while a monitor the layout was kept with is
---    connected and on (hl.get_monitors only lists monitors that are on).
---    Any error or doubt: no rule, so the catch-all keeps the panel ON.
+# The guarded panel-off rule plus undock/dock safety. Plain Lua that runs on
+# 5.1-5.5 and LuaJIT; every call into Hyprland is inside pcall. Rewritten after
+# live test L11 failed (2026-09-23): after an unplug, the reload's load still
+# saw the unplugged monitor in hl.get_monitors and turned the panel off again,
+# leaving only Hyprland's virtual FALLBACK output (black screen).
+GUARD_TEMPLATE = r"""-- 3. Laptop panel(s) OFF only while a monitor the layout was kept with is
+--    connected and on. Safety layers (see docs/hyprland-persistence.md):
+--    a) monitor.removed decides from the EVENT's own data: a kept-with (or
+--       unidentifiable) monitor gone -> panel ON directly, and it's
+--       remembered as gone for GONE_TTL s, because hl.get_monitors can
+--       still list it for a few seconds;
+--    b) "never zero screens": after every load, event and re-check, if no
+--       real monitor is on (FALLBACK/headless don't count) -> panel ON;
+--    c) delayed re-checks after loads and events, reload if the answer
+--       changed (at most one reload per MIN_GAP s, postponed not dropped);
+--    d) a diagnostic log of every load, event and decision.
+--    Any error or doubt: the panel stays / comes ON.
 local PANELS = { @PANELS@ }
 local KEPT_WITH = { @KEPT_WITH@ }
+
+local RUNDIR = os.getenv("XDG_RUNTIME_DIR") or "/tmp"
+local LOGFILE = RUNDIR .. "/displayctl-monitors.log"
+local GONE_FILE = RUNDIR .. "/displayctl-gone"
+local STAMP = RUNDIR .. "/displayctl-reload-stamp"
+local MIN_GAP, GONE_TTL, LOG_MAX = 5, 30, 262144
+
+local function log(msg)
+  pcall(function()
+    local mode = "a"
+    local f = io.open(LOGFILE, "r")
+    if f then
+      local size = f:seek("end")
+      f:close()
+      if size and size > LOG_MAX then mode = "w" end
+    end
+    f = io.open(LOGFILE, mode)
+    if f then f:write(os.date("%H:%M:%S"), " [", tostring(os.time()), "] ", msg, "\n"); f:close() end
+  end)
+end
+
+local function field(m, key)
+  local ok, v = pcall(function() return m[key] end)
+  if ok then return v end
+  return nil
+end
 
 local function is_panel(name)
   if type(name) ~= "string" then return false end
@@ -119,21 +157,86 @@ local function is_panel(name)
       or name:match("^DSI%-") ~= nil
 end
 
+local function is_real(name)  -- a physical monitor, not Hyprland's placeholder
+  return type(name) == "string" and name ~= "FALLBACK" and name:match("^HEADLESS%-") == nil
+end
+
+local function is_kept(desc)
+  if type(desc) ~= "string" then return false end
+  for _, want in ipairs(KEPT_WITH) do
+    if desc == want then return true end
+  end
+  return false
+end
+
+-- "Gone" memory: kept-with monitors unplugged in the last GONE_TTL seconds.
+local function read_gone()
+  local gone = {}
+  pcall(function()
+    local f = io.open(GONE_FILE, "r")
+    if not f then return end
+    for line in f:lines() do
+      local t, desc = line:match("^(%d+)\t(.*)$")
+      if t and os.time() - tonumber(t) < GONE_TTL then gone[desc] = tonumber(t) end
+    end
+    f:close()
+  end)
+  return gone
+end
+
+local function write_gone(gone)
+  pcall(function()
+    local f = io.open(GONE_FILE, "w")
+    if not f then return end
+    for desc, t in pairs(gone) do f:write(tostring(t), "\t", desc, "\n") end
+    f:close()
+  end)
+end
+
+local function monitors()
+  local ok, ms = pcall(hl.get_monitors)
+  if ok and type(ms) == "table" then return ms end
+  return {}
+end
+
+local function describe_monitors()
+  local parts = {}
+  for _, m in ipairs(monitors()) do
+    table.insert(parts, tostring(field(m, "name")) .. "=" .. tostring(field(m, "description")))
+  end
+  return "[" .. table.concat(parts, "; ") .. "]"
+end
+
 local function kept_with_present()
-  local ok, monitors = pcall(hl.get_monitors)
-  if not ok or type(monitors) ~= "table" then return false end
-  for _, m in ipairs(monitors) do
-    local okn, name = pcall(function() return m.name end)
-    local okd, desc = pcall(function() return m.description end)
-    if okn and okd and not is_panel(name) then
-      for _, want in ipairs(KEPT_WITH) do
-        if desc == want then return true end
-      end
+  local gone = read_gone()
+  for _, m in ipairs(monitors()) do
+    local name, desc = field(m, "name"), field(m, "description")
+    if is_real(name) and not is_panel(name) and is_kept(desc) and not gone[desc] then
+      return true
     end
   end
   return false
 end
 
+local function real_monitors_on()
+  local n = 0
+  for _, m in ipairs(monitors()) do
+    if is_real(field(m, "name")) then n = n + 1 end
+  end
+  return n
+end
+
+local function panel_listed()
+  for _, m in ipairs(monitors()) do
+    local name = field(m, "name")
+    for _, p in ipairs(PANELS) do
+      if name == p then return true end
+    end
+  end
+  return false
+end
+
+-- Load-time decision.
 local okp, present = pcall(kept_with_present)
 local PANELS_OFF = (okp and present == true)
 if PANELS_OFF then
@@ -141,16 +244,22 @@ if PANELS_OFF then
     hl.monitor({ output = panel, disabled = true })
   end
 end
+log("load: monitors " .. describe_monitors() .. " -> panel " .. (PANELS_OFF and "OFF" or "on"))
 
--- 4. Undock/dock safety. The check above only runs when the config loads.
---    When an EXTERNAL monitor comes or goes, check again 1 s later (once the
---    monitor list has settled) and reload the config if the answer changed.
---    No loops: right after a reload the answer equals what that load
---    applied, so nothing happens; the panel's own on/off events are ignored;
---    and as a backstop there is at most one reload per MIN_GAP seconds (a
---    blocked check is postponed, never dropped: an undock must not be lost).
-local STAMP = (os.getenv("XDG_RUNTIME_DIR") or "/tmp") .. "/displayctl-reload-stamp"
-local MIN_GAP = 5
+-- Timers and reloads.
+local timers = {}
+
+local function after(ms, fn)
+  local ok = pcall(function()
+    local t
+    t = hl.timer(function()
+      pcall(function() t:set_enabled(false) end)
+      pcall(fn)
+    end, { timeout = ms, type = "repeat" })
+    table.insert(timers, t)
+  end)
+  if not ok then pcall(fn) end  -- no timers available: act right away
+end
 
 local function seconds_since_reload()
   local ok, n = pcall(function()
@@ -164,50 +273,80 @@ local function seconds_since_reload()
   return os.time() - n
 end
 
-local function note_reload()
+local function request_reload(reason)
+  local since = seconds_since_reload()
+  if since < MIN_GAP then
+    log("reload postponed (" .. reason .. "), last reload " .. since .. " s ago")
+    after((MIN_GAP - since) * 1000 + 100, function() request_reload(reason) end)
+    return
+  end
   pcall(function()
     local f = io.open(STAMP, "w")
     if f then f:write(tostring(os.time()), "\n"); f:close() end
   end)
-end
-
-local current_timer = nil
-local schedule
-
-local function recheck()
-  local ok, want = pcall(kept_with_present)
-  want = (ok and want == true)
-  if want == PANELS_OFF then return end
-  local since = seconds_since_reload()
-  if since < MIN_GAP then
-    schedule((MIN_GAP - since) * 1000 + 100)
-    return
-  end
-  note_reload()
+  log("reload (" .. reason .. ")")
   hl.dispatch(hl.dsp.reload_config())
 end
 
-schedule = function(ms)
-  if current_timer then pcall(function() current_timer:set_enabled(false) end) end
-  local ok = pcall(function()
-    local t
-    t = hl.timer(function()
-      pcall(function() t:set_enabled(false) end)
-      pcall(recheck)
-    end, { timeout = ms, type = "repeat" })
-    current_timer = t
+local function enable_panels_now(reason)
+  for _, panel in ipairs(PANELS) do
+    local ok = pcall(hl.monitor, { output = panel, mode = "preferred", position = "auto", scale = 1 })
+    log("panel " .. panel .. " ON directly (" .. reason .. ")" .. (ok and "" or " [hl.monitor failed]"))
+  end
+  -- If the direct rule didn't take effect, reload (the load then honours the
+  -- "gone" memory, so it won't turn the panel off again).
+  after(1000, function()
+    if not panel_listed() then request_reload("panel still off after direct enable") end
   end)
-  if not ok then pcall(recheck) end  -- no timers available: check right away
 end
 
-local function on_monitor_event(m)
-  local ok, name = pcall(function() return m.name end)
-  if ok and is_panel(name) then return end  -- our own panel switching: ignore
-  pcall(schedule, 1000)
+local function recheck(reason)
+  local okw, want = pcall(kept_with_present)
+  want = (okw and want == true)
+  local real = real_monitors_on()
+  log("check (" .. reason .. "): monitors " .. describe_monitors() .. ", kept-with present "
+      .. tostring(want) .. ", real monitors on " .. real .. ", loaded with panel "
+      .. (PANELS_OFF and "OFF" or "on"))
+  if real == 0 then  -- invariant: never zero screens
+    enable_panels_now("no real monitor on")
+    return
+  end
+  if want ~= PANELS_OFF then request_reload(reason) end
 end
 
-pcall(hl.on, "monitor.added", on_monitor_event)
-pcall(hl.on, "monitor.removed", on_monitor_event)'''
+-- Handlers.
+local function on_removed(m)
+  local name, desc = field(m, "name"), field(m, "description")
+  log("event monitor.removed " .. tostring(name) .. " = " .. tostring(desc))
+  if is_panel(name) then return end  -- our own panel switching
+  if is_kept(desc) or desc == nil or name == nil then
+    -- Decide from the event itself: don't wait for hl.get_monitors to catch up.
+    if desc ~= nil then
+      local gone = read_gone(); gone[desc] = os.time(); write_gone(gone)
+    end
+    if PANELS_OFF then enable_panels_now("kept-with monitor removed") end
+  end
+  after(1000, function() recheck("1 s after removal") end)
+  after(3000, function() recheck("3 s after removal") end)
+end
+
+local function on_added(m)
+  local name, desc = field(m, "name"), field(m, "description")
+  log("event monitor.added " .. tostring(name) .. " = " .. tostring(desc))
+  if is_panel(name) then return end
+  if is_kept(desc) then
+    local gone = read_gone(); gone[desc] = nil; write_gone(gone)
+  end
+  after(1000, function() recheck("1 s after addition") end)
+  after(3000, function() recheck("3 s after addition") end)
+end
+
+pcall(hl.on, "monitor.added", on_added)
+pcall(hl.on, "monitor.removed", on_removed)
+
+-- After every load: re-check once things have settled (also enforces the
+-- "never zero screens" invariant after a reload).
+after(2500, function() recheck("2.5 s after load") end)"""
 
 
 def kept_json(states, descriptions, now=None):
@@ -227,39 +366,112 @@ def kept_json(states, descriptions, now=None):
 
 # --- self-check: run the generated Lua against a mock `hl` ---------------------------
 
-# A tiny fake Hyprland for the generated file. Scenario comes in as globals:
-#   SC_MONITORS = list of {name=..., description=...} | "error" | "nil" | "junk"
-#   SC_TIMERS   = true/false (whether hl.timer exists)
-#   SC_EVENT    = nil | { name = "monitor.added"/"monitor.removed",
-#                         monitor = {...}, after = <SC_MONITORS-like> }
-# Prints: RULE lines, HANDLER lines, then RELOADS <n> after the event (if any).
-MOCK_DRIVER = r'''
-local calls, handlers, timers, reloads = {}, {}, {}, 0
+# A small fake Hyprland with a simulated clock. Scenario globals:
+#   SC_FILE      the generated file
+#   SC_BEFORE    external monitors at the start: list of {name=, description=}
+#                | "error" | "nil" | "junk" | "destroyed"
+#   SC_TIMERS    whether hl.timer exists
+#   SC_EVENT     nil | { name = "monitor.added"/"monitor.removed",
+#                        monitor = {...} or "destroyed", after = <list>,
+#                        at = seconds after the load, slow = seconds that
+#                        hl.get_monitors keeps returning the OLD list }
+#   SC_DIRECT    whether a runtime hl.monitor(...) turning the panel on works
+#   SC_RUN_FOR   simulated seconds
+# The panel (eDP-1) is listed by get_monitors while it's on. A reload re-runs
+# the file in a fresh state (old timers/handlers gone, catch-all turns the
+# panel on, then the file's rules apply). Prints the first load's RULE and
+# HANDLER lines, then RELOADS, RELOAD_AT, LOADS, PANEL_ON, BLACK_SECONDS
+# (panel off while no real external monitor is actually connected),
+# DIRECT_ENABLES, TIMERS_PENDING.
+MOCK_DRIVER = r"""
+local PANEL = "eDP-1"
+local T0 = 1000000
+local CLOCK = T0
+os.time = function() return math.floor(CLOCK) end
 local DESTROYED = setmetatable({}, { __index = function() error("object destroyed") end })
-local function list(v)
-  if v == "error" then error("get_monitors exploded") end
-  if v == "destroyed" then return { DESTROYED } end
-  if v == "nil" then return nil end
-  if v == "junk" then return 42 end
+
+local handlers, timers, first_rules, loading = {}, {}, {}, false
+local reloads, reload_at, loads, direct = 0, {}, 0, 0
+local panel_on = true
+local reload_requested = false
+local event_fired, event_time = false, nil
+
+local function externals_view()   -- what get_monitors shows (can lag)
+  local v = SC_BEFORE
+  if SC_EVENT and event_fired and CLOCK >= event_time + (SC_EVENT.slow or 0) then v = SC_EVENT.after end
   return v
 end
+local function externals_truth()  -- what is really connected
+  if SC_EVENT and event_fired then return SC_EVENT.after end
+  return SC_BEFORE
+end
+local function real_count(v)
+  if type(v) ~= "table" then return 0 end
+  local n = 0
+  for _, m in ipairs(v) do if m.name ~= "FALLBACK" and m.name ~= PANEL then n = n + 1 end end
+  return n
+end
+
 hl = {
-  monitor = function(t) table.insert(calls, t) end,
-  get_monitors = function() return list(SC_MONITORS) end,
+  monitor = function(t)
+    if loads == 1 and loading then table.insert(first_rules, t) end
+    if t.output == PANEL then
+      if t.disabled then panel_on = false
+      elseif loading then panel_on = true
+      else direct = direct + 1; if SC_DIRECT ~= false then panel_on = true end end
+    end
+  end,
+  get_monitors = function()
+    local v = externals_view()
+    if v == "error" then error("get_monitors exploded") end
+    if v == "nil" then return nil end
+    if v == "junk" then return 42 end
+    if v == "destroyed" then return { DESTROYED } end
+    local out = {}
+    for _, m in ipairs(v) do if m.name ~= PANEL then table.insert(out, m) end end
+    if panel_on then table.insert(out, { name = PANEL, description = "BOE 0x0AAE" }) end
+    return out
+  end,
   on = function(name, fn) handlers[name] = fn end,
   dsp = { reload_config = function() return "RELOAD" end },
-  dispatch = function(x) if x == "RELOAD" then reloads = reloads + 1 end end,
+  dispatch = function(x)
+    if x == "RELOAD" then
+      reloads = reloads + 1
+      table.insert(reload_at, string.format("%.1f", CLOCK - T0))
+      reload_requested = true
+    end
+  end,
 }
 if SC_TIMERS then
   hl.timer = function(fn, opts)
-    local t = { fn = fn, enabled = true, timeout = opts.timeout }
+    local t = { fn = fn, enabled = true, due = CLOCK + opts.timeout / 1000 }
     function t:set_enabled(v) self.enabled = v end
     table.insert(timers, t)
     return t
   end
 end
-dofile(SC_FILE)
-for _, c in ipairs(calls) do
+
+local function load()
+  for _, t in ipairs(timers) do t.enabled = false end  -- a reload destroys the old Lua state
+  timers, handlers = {}, {}
+  panel_on = true                                       -- the catch-all rule
+  loads = loads + 1
+  loading = true
+  dofile(SC_FILE)
+  loading = false
+end
+
+local black, last = 0, CLOCK
+local function account()
+  if not panel_on and real_count(externals_truth()) == 0 then black = black + (CLOCK - last) end
+  last = CLOCK
+end
+local function after_callback()
+  if reload_requested then reload_requested = false; load() end
+end
+
+load()
+for _, c in ipairs(first_rules) do
   local keys = {}
   for k, v in pairs(c) do table.insert(keys, k .. "=" .. tostring(v)) end
   table.sort(keys)
@@ -268,31 +480,43 @@ end
 for _, name in ipairs({ "monitor.added", "monitor.removed" }) do
   if handlers[name] then print("HANDLER " .. name) end
 end
-if SC_EVENT then
-  SC_MONITORS = SC_EVENT.after
-  local arg = SC_EVENT.monitor
-  if arg == "destroyed" then arg = DESTROYED end
-  if handlers[SC_EVENT.name] then handlers[SC_EVENT.name](arg) end
-  -- Fire timers in rounds, like time passing: each round fires only the
-  -- timers that existed when it started (a timer created by a firing timer
-  -- waits for the next round, as a real timeout would). Time itself does not
-  -- advance, so a postponed check stays pending.
-  local fired = 0
-  for _ = 1, 3 do
-    local due = {}
-    for _, t in ipairs(timers) do if t.enabled then table.insert(due, t) end end
-    if #due == 0 then break end
-    for _, t in ipairs(due) do
-      if t.enabled then fired = fired + 1; t.fn() end
-    end
+
+local deadline = T0 + (SC_RUN_FOR or 20)
+if SC_EVENT then event_time = T0 + (SC_EVENT.at or 1) end
+for _ = 1, 10000 do
+  local next_t, next_timer = nil, nil
+  for _, t in ipairs(timers) do
+    if t.enabled and (next_t == nil or t.due < next_t) then next_t, next_timer = t.due, t end
   end
-  local still = 0
-  for _, t in ipairs(timers) do if t.enabled then still = still + 1 end end
-  print("TIMERS_FIRED " .. fired)
-  print("TIMERS_PENDING " .. still)
-  print("RELOADS " .. reloads)
+  if SC_EVENT and not event_fired and (next_t == nil or event_time <= next_t) then
+    next_t, next_timer = event_time, "event"
+  end
+  if next_t == nil or next_t > deadline then break end
+  CLOCK = next_t
+  account()
+  if next_timer == "event" then
+    event_fired = true
+    local arg = SC_EVENT.monitor
+    if arg == "destroyed" then arg = DESTROYED end
+    if handlers[SC_EVENT.name] then handlers[SC_EVENT.name](arg) end
+  else
+    next_timer.enabled = false
+    next_timer.fn()
+  end
+  after_callback()
 end
-'''
+CLOCK = deadline
+account()
+local pending = 0
+for _, t in ipairs(timers) do if t.enabled then pending = pending + 1 end end
+print("RELOADS " .. reloads)
+print("RELOAD_AT " .. table.concat(reload_at, ","))
+print("LOADS " .. loads)
+print("PANEL_ON " .. tostring(panel_on))
+print(string.format("BLACK_SECONDS %.1f", black))
+print("DIRECT_ENABLES " .. direct)
+print("TIMERS_PENDING " .. pending)
+"""
 
 
 def lua_value(v):
@@ -301,6 +525,8 @@ def lua_value(v):
         return "nil"
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
     if isinstance(v, str):
         return lua_str(v)
     if isinstance(v, dict):
@@ -310,37 +536,61 @@ def lua_value(v):
     raise TypeError(v)
 
 
-def run_mock(lua_text, monitors, timers=True, event=None, lua="lua", env=None, stamp_age=None):
-    """Run generated Lua against the mock. Returns (rules, handlers, reloads, stdout).
+class MockResult:
+    """What the mock run printed, parsed."""
 
-    monitors: list of {"name","description"} dicts, or "error"/"nil"/"junk"/
-    "destroyed" (an entry whose fields raise, like a destroyed Hyprland object).
-    event: {"name": "monitor.removed", "monitor": {...} or "destroyed", "after": monitors}.
-    stamp_age: pretend the last reload was this many seconds ago (rate limit).
+    def __init__(self, stdout):
+        self.stdout = stdout
+        lines = stdout.splitlines()
+        self.rules = [l[5:] for l in lines if l.startswith("RULE ")]
+        self.handlers = [l[8:] for l in lines if l.startswith("HANDLER ")]
+        vals = dict(l.split(" ", 1) for l in lines if " " in l and l.split(" ", 1)[0].isupper()
+                    and not l.startswith(("RULE ", "HANDLER ")))
+        self.reloads = int(vals.get("RELOADS", 0))
+        self.reload_at = [float(x) for x in vals.get("RELOAD_AT", "").split(",") if x]
+        self.loads = int(vals.get("LOADS", 0))
+        self.panel_on = vals.get("PANEL_ON") == "true"
+        self.black = float(vals.get("BLACK_SECONDS", 0))
+        self.direct = int(vals.get("DIRECT_ENABLES", 0))
+        self.pending = int(vals.get("TIMERS_PENDING", 0))
+
+    def panel_disabled_at_load(self, panel="eDP-1"):
+        return any(f"output={panel}" in r and "disabled=true" in r for r in self.rules)
+
+
+def run_mock(lua_text, before, timers=True, event=None, lua="lua", stamp_age=None,
+             direct_works=True, run_for=20, gone=None):
+    """Run generated Lua against the mock (see MOCK_DRIVER). Returns MockResult.
+
+    stamp_age: pretend the last handler reload was this many seconds ago.
+    gone: {description: seconds_ago} pre-filled "recently unplugged" memory.
     """
     with tempfile.TemporaryDirectory() as tmp:
         gen = Path(tmp) / "monitors.lua"
         gen.write_text(lua_text)
-        mon = monitors if isinstance(monitors, list) else monitors
         prelude = (f"SC_FILE = {lua_str(str(gen))}\n"
-                   f"SC_MONITORS = {lua_value(mon)}\n"
+                   f"SC_BEFORE = {lua_value(before)}\n"
                    f"SC_TIMERS = {lua_value(timers)}\n"
-                   f"SC_EVENT = {lua_value(event)}\n")
+                   f"SC_EVENT = {lua_value(event)}\n"
+                   f"SC_DIRECT = {lua_value(direct_works)}\n"
+                   f"SC_RUN_FOR = {lua_value(run_for)}\n")
         driver = Path(tmp) / "driver.lua"
         driver.write_text(prelude + MOCK_DRIVER)
+        t0 = 1000000  # the mock's clock start (os.time() inside the mock)
         if stamp_age is not None:
-            import time
-            (Path(tmp) / "displayctl-reload-stamp").write_text(f"{int(time.time()) - stamp_age}\n")
-        run_env = dict(os.environ, XDG_RUNTIME_DIR=tmp, **(env or {}))
-        out = subprocess.run([lua, str(driver)], capture_output=True, text=True,
-                             timeout=10, env=run_env)
+            (Path(tmp) / "displayctl-reload-stamp").write_text(f"{t0 - stamp_age}\n")
+        if gone:
+            (Path(tmp) / "displayctl-gone").write_text(
+                "".join(f"{t0 - age}\t{d}\n" for d, age in gone.items()))
+        env = dict(os.environ, XDG_RUNTIME_DIR=tmp)
+        out = subprocess.run([lua, str(driver)], capture_output=True, text=True, timeout=20, env=env)
+        log_text = (Path(tmp) / "displayctl-monitors.log").read_text() \
+            if (Path(tmp) / "displayctl-monitors.log").exists() else ""
     if out.returncode != 0:
         raise RuntimeError(f"{lua} failed: {out.stderr.strip()}")
-    rules = [line[5:] for line in out.stdout.splitlines() if line.startswith("RULE ")]
-    handlers = [line[8:] for line in out.stdout.splitlines() if line.startswith("HANDLER ")]
-    reloads = next((int(line.split()[1]) for line in out.stdout.splitlines()
-                    if line.startswith("RELOADS ")), None)
-    return rules, handlers, reloads, out.stdout
+    result = MockResult(out.stdout)
+    result.log = log_text
+    return result
 
 
 def self_check(lua_text, data):
@@ -356,23 +606,24 @@ def self_check(lua_text, data):
     panels = data["guarded_panels"]
     docked = [{"name": n, "description": d} for n, d in data["descriptions"].items()
               if d in data["kept_with"]]
-
-    def panel_disabled(rules):
-        return all(any(f"output={p}" in r and "disabled=true" in r for r in rules) for p in panels)
-
     try:
-        rules, _, _, _ = run_mock(lua_text, docked, lua=lua)
-        if panels and not panel_disabled(rules):
+        r = run_mock(lua_text, docked, lua=lua)
+        if panels and not r.panel_disabled_at_load():
             problems.append("docked: the laptop panel is not turned off")
-        for scenario in ([], "error", "nil", "junk"):
-            rules, _, _, _ = run_mock(lua_text, scenario, lua=lua)
-            if any(f"output={p}" in r and "disabled=true" in r for p in panels for r in rules):
+        for scenario in ([], "error", "nil", "junk", "destroyed"):
+            r = run_mock(lua_text, scenario, lua=lua)
+            if any(r.panel_disabled_at_load(p) for p in panels):
                 problems.append(f"{scenario!r}: the laptop panel would be turned off (unsafe)")
         if panels and docked:
-            _, _, reloads, _ = run_mock(lua_text, docked, lua=lua, event={
-                "name": "monitor.removed", "monitor": docked[0], "after": []})
-            if reloads != 1:
-                problems.append(f"undock: expected 1 reload, got {reloads}")
+            # The case that failed live: get_monitors keeps listing the
+            # unplugged monitor for a few seconds.
+            for slow in (0, 3, 8):
+                r = run_mock(lua_text, docked, lua=lua, event={
+                    "name": "monitor.removed", "monitor": docked[0], "after": [], "at": 1,
+                    "slow": slow})
+                if not r.panel_on or r.black > 0.5:
+                    problems.append(f"undock (list {slow} s stale): panel on={r.panel_on}, "
+                                    f"black {r.black:.1f} s")
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         problems.append(f"generated file doesn't run: {e}")
     return problems

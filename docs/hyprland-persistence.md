@@ -62,7 +62,7 @@ rules file describes mode, position, scale and transform, plus only these
 on/off rules: plain `disabled` for external monitors that were off, and the
 guarded disable for a laptop panel (see "Durable Keep").
 
-## Durable Keep: detailed design (2026-09-23; implemented, U1/U2 + L1-L9 passed; L10/L11 pending)
+## Durable Keep: detailed design (2026-09-23; U1/U2 + L1-L9 passed; L11 FAILED, fix built, re-test pending)
 
 ### Files (all ours, in `~/.config/hypr/displayctl/`)
 
@@ -183,6 +183,42 @@ new layout was already live and confirmed, so the file only has to match it.
 Implementation: durable.py (generate_lua, kept_json, self_check, keep,
 undo, atomic_write). Not wired into the GUI/CLI yet.
 
+### L11 failure (2026-09-23) and the fix
+
+Live: eDP-1 kept off by the file, kanshi off, the Samsung unplugged. The
+handler reloaded ~1 s later (stamp 20:28:26), but the panel stayed off:
+only Hyprland's virtual FALLBACK output was on, for >= 13 s until the
+Samsung was plugged back in (no eDP-1 modeset in Hyprland's log). Most
+likely cause: at that reload `hl.get_monitors` still listed the unplugged
+Samsung, so the guard fired again, and no further event came. The unit
+tests missed it because the mock's monitor list changed instantly.
+Immediately afterwards the file was regenerated WITHOUT any eDP-1 rule
+(Option B); kanshi handles eDP-1 again until the fix passes L11.
+
+The fix (durable.GUARD_TEMPLATE, not yet live-tested):
+- `monitor.removed` decides from the event's own data: a kept-with (or
+  unidentifiable) monitor removed -> the panel is turned ON directly
+  (`hl.monitor` with preferred/auto), and the monitor is remembered as
+  gone for 30 s in `$XDG_RUNTIME_DIR/displayctl-gone`; at load, a
+  "gone" monitor counts as absent even if `get_monitors` still lists it.
+  A replug (`monitor.added`) clears the memory.
+- Invariant "never zero screens": after every load, event and re-check,
+  if no real monitor is on (FALLBACK/HEADLESS-* ignored) -> panel ON.
+- Delayed re-checks 1 s and 3 s after events and 2.5 s after every load;
+  reload only if the answer changed (<= 1 per 5 s, postponed not
+  dropped). If a direct enable didn't take within 1 s -> reload.
+- Diagnostic log `$XDG_RUNTIME_DIR/displayctl-monitors.log` (every load
+  with the monitor list and decision, every event, check and action;
+  capped at 256 KB).
+- The mock now has a simulated clock, a get_monitors that keeps listing
+  the unplugged monitor for N s, and real reload semantics; it measures
+  "black" time. With the fix: panel on at the event, 0 s black, for
+  stale lists of 0-20 s; without the gone memory the model reproduces the
+  live failure (test i3). self_check runs the stale-list undock too.
+
+Next: re-run L11 (with the recorder started BEFORE unplugging) once the
+user approves; only then Keep layouts with eDP-1 off again.
+
 ### Revert after a durable Keep ("Undo last Keep")
 
 A separate action (CLI `displayctl.py undo`, later a GUI button): swap
@@ -262,7 +298,8 @@ checked in both views + `hyprctl configerrors`; results inline):
 - **L9** Restore baseline (DP-3 200 at 0,0, eDP-1 off) with a final Keep,
   so the file on disk matches it. -> Done via undo + keep; a plain reload
   keeps it.
-- **L11** (required before anything relies on the file for docking) With
+- **L11** FAILED on 2026-09-23 (see "L11 failure and the fix"); re-test
+  pending. (required before anything relies on the file for docking) With
   eDP-1 kept off by the file and kanshi stopped, the user physically
   unplugs the Samsung: the laptop panel must come on within a few seconds
   (handler -> reload -> guard false). Then plug it back in: eDP-1 should

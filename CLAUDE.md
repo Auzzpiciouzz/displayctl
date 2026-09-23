@@ -86,10 +86,11 @@ GTK); gui.py handles edits from GLib.idle_add.
 1. DONE 2026-09-23: drag-to-arrange tests 2–8 passed live on the real GUI
    (tests/gui_live_arrange.py, 41/41 checks + SIGINT test; DP-3 returns to
    0,0 when eDP-1 is turned off; 15 s timeout measured 15.006 s).
-2. Durable Keep: implemented; U1/U2 + L1-L9 passed. PENDING (need the user):
-   L11 physical unplug of the Samsung with eDP-1 kept off (panel must come
-   on within seconds) — REQUIRED before relying on the file for docking;
-   L10 login test (comment out hl.exec_cmd("kanshi") temporarily).
+2. Durable Keep: implemented; U1/U2 + L1-L9 passed. L11 (physical unplug)
+   FAILED 2026-09-23 (panel stayed black); fix built + unit-tested, NOT yet
+   live-tested. Current file has NO eDP-1 rule (kanshi handles eDP-1).
+   Don't Keep a layout with eDP-1 off until L11 passes. Re-run L11 with the
+   recorder started BEFORE the unplug; L10 later (comment out kanshi).
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.
@@ -103,6 +104,8 @@ GTK); gui.py handles edits from GLib.idle_add.
   stays connected after applying), so it blocks all other tools while it
   runs; that likely explains the first night's "revert didn't take" failures.
 - Never edit ~/.config/hypr/hyprland.lua; the app owns only its own monitors.lua
+- Never `pkill -f`/`pgrep -f` with a pattern that can match your own shell
+  command line (it killed the test shell twice): use exact PIDs.
 - Any apply must be revertible; test before apply. Display changes go through
   displayctl.py (snapshot + watchdog), never ad-hoc scripts
 - Generated monitors.lua must never disable eDP-1 (undocked boot = no screen);
