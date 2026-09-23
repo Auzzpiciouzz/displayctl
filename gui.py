@@ -32,6 +32,7 @@ import ctypes
 import logging
 import os
 import select
+import signal
 import sys
 
 import gi
@@ -212,29 +213,42 @@ class LayoutCanvas(Gtk.DrawingArea):
                 boxes.append((head, s, s["position"][0], s["position"][1], w, h))
 
         # Disabled heads: a row starting one "gap" to the right of the layout.
-        right = max((b[2] + b[4] for b in boxes), default=0)
-        top = min((b[3] for b in boxes), default=0)
-        gap = max(right // 12, 200)  # spacing, scaled to the layout
-        x = right + gap if boxes else 0
+        # While dragging, the row stays where it was at drag start (it's
+        # placed relative to the layout, which the drag is changing).
+        if self._drag and "disabled_row" in self._drag:
+            row = self._drag["disabled_row"]
+        else:
+            right = max((b[2] + b[4] for b in boxes), default=0)
+            top = min((b[3] for b in boxes), default=0)
+            gap = max(right // 12, 200)  # spacing, scaled to the layout
+            x = right + gap if boxes else 0
+            row = {}
+            for head in self.window.om.heads:
+                s = states[head.name]
+                if s["enabled"] and s["mode"]:
+                    continue
+                mode = head.preferred_mode()
+                if mode is None:
+                    continue  # nothing to size it by
+                row[head.name] = (x, top, mode.width, mode.height)
+                x += mode.width + gap
         for head in self.window.om.heads:
-            s = states[head.name]
-            if s["enabled"] and s["mode"]:
-                continue
-            mode = head.preferred_mode()
-            if mode is None:
-                continue  # nothing to size it by
-            boxes.append((head, s, x, top, mode.width, mode.height))
-            x += mode.width + gap
+            if head.name in row:
+                boxes.append((head, states[head.name], *row[head.name]))
         return boxes
 
     def _draw(self, area, cr, width, height):
         boxes = self._layout_boxes()
-        log.debug("redraw %dx%d, pending: %s", width, height, sorted(self.window.pending))
+        if self._drag:
+            # A drag redraws every frame; count instead of logging each one.
+            self._drag["frames"] = self._drag.get("frames", 0) + 1
+        else:
+            log.debug("redraw %dx%d, pending: %s", width, height, sorted(self.window.pending))
         self._hit_boxes = []
         if not boxes:
             return
 
-        if self._drag:
+        if self._drag and "view" in self._drag:
             # Frozen mapping while dragging.
             factor, offset_x, offset_y, left, top = self._drag["view"]
         else:
@@ -326,17 +340,39 @@ class LayoutCanvas(Gtk.DrawingArea):
                 return name
         return None
 
+    # A press becomes a "drag" once the pointer moves this far (screen px);
+    # below that it's just a click that selects.
+    DRAG_START_PX = 6
+
     def _on_drag_begin(self, gesture, x, y):
         name = self._hit(x, y)
         if name not in self._enabled_names or self._view is None or self.window.applier.busy:
             gesture.set_state(Gtk.EventSequenceState.DENIED)  # nothing to drag
             return
+        if len(self._enabled_names) < 2:
+            # Nothing to arrange. Don't refuse the press yet (it may be a
+            # click that selects); hint only if the pointer actually moves.
+            self._drag = {"name": name, "single": True, "hinted": False}
+            return
         start = self.window.effective()[name]["position"]
-        self._drag = {"name": name, "start": tuple(start), "view": self._view, "preview": None}
+        self._drag = {"name": name, "start": tuple(start), "view": self._view,
+                      "preview": None, "frames": 0,
+                      "disabled_row": self._disabled_row()}
         log.debug("drag begin %s at %s", name, start)
+
+    def _disabled_row(self):
+        """{name: (x, y, w, h)} of the disabled row as drawn right now."""
+        states = self.window.effective()
+        return {b[0].name: b[2:] for b in self._layout_boxes()
+                if not (states[b[0].name]["enabled"] and states[b[0].name]["mode"])}
 
     def _on_drag_update(self, gesture, dx, dy):
         if not self._drag:
+            return
+        if self._drag.get("single"):
+            if not self._drag["hinted"] and max(abs(dx), abs(dy)) >= self.DRAG_START_PX:
+                self._drag["hinted"] = True
+                self.window.toast("Turn on another display to arrange them.")
             return
         factor = self._drag["view"][0]
         sx, sy = self._drag["start"]
@@ -349,9 +385,13 @@ class LayoutCanvas(Gtk.DrawingArea):
     def _on_drag_end(self, gesture, dx, dy):
         if not self._drag:
             return
+        if self._drag.get("single"):
+            self._drag = None
+            return
         self._on_drag_update(gesture, dx, dy)
         drag, self._drag = self._drag, None
-        log.debug("drag end %s at %s", drag["name"], drag["preview"])
+        log.debug("drag end %s at %s (%d frames drawn)",
+                  drag["name"], drag["preview"], drag.get("frames", 0))
         if drag["preview"] and tuple(drag["preview"]) != drag["start"]:
             self.window.on_move(drag["name"], drag["preview"])
         else:
@@ -892,7 +932,7 @@ class MainWindow(Adw.ApplicationWindow):
         if what in ("resolution", "scale", "rotation"):
             # The monitor's logical size changed: keep neighbours attached.
             new_states = layout.reflow_after_resize(states, new_states, name)
-        self._set_states(layout.normalize(new_states, self.anchor()))
+        self._set_states(layout.normalize(new_states))
         log.debug("edit %s %s=%s -> pending %s", name, what, value, sorted(self.pending))
         self.refresh()
 
@@ -900,13 +940,9 @@ class MainWindow(Adw.ApplicationWindow):
         """A monitor was dragged to `pos` (already snapped to a legal spot)."""
         if self.om.head(name) is None or self.applier.busy:
             return
-        self._set_states(layout.moved(self.effective(), name, pos, self.anchor()))
+        self._set_states(layout.moved(self.effective(), name, pos))
         log.debug("move %s to %s -> pending %s", name, pos, sorted(self.pending))
         self.refresh()
-
-    def anchor(self):
-        """The monitor that stays at 0,0 (decided from the LIVE layout)."""
-        return layout.anchor_name({h.name: h.to_state() for h in self.om.heads})
 
     def _set_states(self, states):
         """Make `states` the effective layout: pending = what differs from live."""
@@ -998,6 +1034,7 @@ class DisplayctlApp(Adw.Application):
     def _on_shutdown(self, app):
         # Closing the window mid-countdown: our connection closes here, and
         # the watchdog sees its pipe close when we exit, so it reverts.
+        log.debug("shutdown: closing the Wayland connection")
         if self.source is not None:
             self.source.stop()
         if self.om is not None and self.om.display._ptr is not None:
@@ -1029,4 +1066,21 @@ if __name__ == "__main__":
     )
     if debug:
         GLib.log_set_writer_func(drop_vk_suboptimal)
-    sys.exit(DisplayctlApp().run(argv))
+
+    app = DisplayctlApp()
+
+    def quit_on_signal():
+        """Ctrl+C / kill: quit through the normal shutdown path, so the
+        Wayland connection is closed properly (and no traceback)."""
+        log.debug("signal received: quitting")
+        app.quit()
+        return GLib.SOURCE_CONTINUE
+
+    # Python's default SIGINT handler raises KeyboardInterrupt, and PyGObject
+    # installs its own fallback while app.run() runs if that default is still
+    # in place. Replace it, then let GLib deliver the signals as main-loop
+    # events instead.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signum, quit_on_signal)
+    sys.exit(app.run(argv))

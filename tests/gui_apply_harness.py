@@ -281,18 +281,72 @@ def drag(name, to_logical, finish=True):
     return g
 def pos(name): return tuple(W().effective()[name]["position"])
 
+toasts = []
+log_lines = []
+class ListHandler(__import__("logging").Handler):
+    def emit(self, record): log_lines.append(record.getMessage())
+__import__("logging").getLogger("displayctl.gui").addHandler(ListHandler())
+
+def box(name):
+    return next(tuple(round(v) for v in b[1:]) for b in W().canvas._hit_boxes if b[0] == name)
+
 def s_drag_disabled_denied():
     W().clear_pending()
+    real_toast = W().toast
+    W().toast = lambda text: (toasts.append(text), real_toast(text))
     g = drag("eDP-1", (0, 2000))
     check("disabled monitor can't be dragged", g.state is not None and W().pending == {})
+    return False
+
+def s_single_monitor_hint():
+    # only DP-3 is on: dragging it must do nothing but show the hint (once)
+    redraw(); n = len(toasts); before = box("eDP-1")
+    c = W().canvas; g = FakeGesture(); x, y = center("DP-3")
+    c._on_drag_begin(g, x, y)
+    c._on_drag_update(g, 2, 1)                # tiny: still a click, no hint
+    hint_after_tiny = len(toasts) > n
+    for d in (40, 120, 300): c._on_drag_update(g, d, 0)
+    c._on_drag_end(g, 300, 0)
+    check("single monitor: no hint for a tiny move (a click)", not hint_after_tiny)
+    check("single monitor: drag refused with one hint",
+          toasts[n:] == ["Turn on another display to arrange them."] and W().pending == {}, toasts[n:])
+    redraw()
+    check("single monitor: nothing moved", box("eDP-1") == before)
+    return False
+
+def s_disabled_row_fixed():
+    # fixed-row code path: fake an in-progress drag of DP-3 far to the right
+    redraw(); c = W().canvas; before = box("eDP-1")
+    c._drag = {"name": "DP-3", "start": (0, 0), "view": c._view, "preview": (6000, 0),
+               "frames": 0, "disabled_row": c._disabled_row()}
+    redraw_keep = c._view; c.queue_draw()
+    ctx = GLib.MainContext.default()
+    for _ in range(30): ctx.iteration(False)
+    during = box("eDP-1")
+    c._drag = None
+    check("disabled row stays put while another monitor is dragged", during == before, (before, during))
     return False
 
 def s_drag_left():
     select("eDP-1"); use(True)                         # pending: eDP-1 on at 2560,0
     check("enabled eDP-1 placed right of DP-3", pos("eDP-1") == (2560, 0))
-    drag("eDP-1", (-2400, 30))                        # far left, a bit low
-    check("dragged left: snaps flush + top-aligned, DP-3 stays at 0,0",
-          pos("eDP-1") == (-1920, 0) and pos("DP-3") == (0, 0), (pos("eDP-1"), pos("DP-3")))
+    redraw(); dp3_before = box("DP-3")
+    drag("eDP-1", (-2400, 30), finish=False)          # far left, a bit low
+    redraw_frames = [l for l in log_lines if l.startswith("redraw")]
+    ctx = GLib.MainContext.default()
+    for _ in range(30): ctx.iteration(False)
+    check("while dragging eDP-1, DP-3 stays still on screen", box("DP-3") == dp3_before,
+          (dp3_before, box("DP-3")))
+    n_redraw = sum(1 for l in log_lines if l.startswith("redraw"))
+    W().canvas._on_drag_update(FakeGesture(), -3000, 20); W().canvas._on_drag_update(FakeGesture(), -3100, 25)
+    for _ in range(30): ctx.iteration(False)
+    check("no per-frame 'redraw' log lines during a drag",
+          sum(1 for l in log_lines if l.startswith("redraw")) == n_redraw)
+    c = W().canvas; factor = c._drag["view"][0]; sx, sy = c._drag["start"]
+    c._on_drag_end(FakeGesture(), (-2400 - sx) * factor, (30 - sy) * factor)
+    check("drag end logs a frame summary", any("frames drawn" in l for l in log_lines))
+    check("dragged left: eDP-1 normalised to 0,0, DP-3 to 1920,0 (no negatives)",
+          pos("eDP-1") == (0, 0) and pos("DP-3") == (1920, 0), (pos("eDP-1"), pos("DP-3")))
     check("layout legal after drag", layout.arrangement_problems(W().effective()) == [])
     return False
 
@@ -308,9 +362,16 @@ def s_drag_preview_shot():
 
 def s_drag_anchor():
     W().clear_pending(); select("eDP-1"); use(True)   # eDP-1 at 2560,0 pending
-    drag("DP-3", (1920 + 2560 + 100, 0))              # drag the anchor past eDP-1
-    check("dragging the anchor keeps it at 0,0; eDP-1 moves to -1920",
-          pos("DP-3") == (0, 0) and pos("eDP-1") == (-1920, 0), (pos("DP-3"), pos("eDP-1")))
+    redraw(); edp_before = box("eDP-1")
+    drag("DP-3", (1920 + 2560 + 100, 0), finish=False)  # drag the 0,0 monitor past eDP-1
+    ctx = GLib.MainContext.default()
+    for _ in range(30): ctx.iteration(False)
+    check("while dragging DP-3 (at 0,0), eDP-1 stays still on screen", box("eDP-1") == edp_before,
+          (edp_before, box("eDP-1")))
+    c = W().canvas; factor = c._drag["view"][0]; sx, sy = c._drag["start"]
+    c._on_drag_end(FakeGesture(), (1920 + 2560 + 100 - sx) * factor, 0)
+    check("after release: eDP-1 at 0,0, DP-3 at 1920,0",
+          pos("eDP-1") == (0, 0) and pos("DP-3") == (1920, 0), (pos("DP-3"), pos("eDP-1")))
     GLib.timeout_add(400, lambda: (shot("t7-after-anchor-drag"), False)[1])
     return False
 
@@ -326,7 +387,7 @@ def s_apply_after_drag():
     n = len(applied); W().apply_button.emit("clicked")
     sent = applied[-1][1] if len(applied) > n else {}
     check("Apply sends the dragged positions (full config)",
-          sent.get("eDP-1", {}).get("position") == [-1920, 0] and sent.get("DP-3", {}).get("position") == [0, 0],
+          sent.get("eDP-1", {}).get("position") == [0, 0] and sent.get("DP-3", {}).get("position") == [1920, 0],
           {k: v.get("position") for k, v in sent.items()})
     return False
 def s_keep_after_drag():
@@ -358,7 +419,8 @@ steps = [(1500, s_start), (1200, s_guard_all_off), (1200, s_enable_edp_then_off_
          (600, s_apply_cancelled),
          (800, s_second_check_catches_late_change), (6500, s_after_second_check),
          (800, s_revert_fails_handover),
-         (5000, s_drag_disabled_denied), (800, s_drag_left), (900, s_drag_preview_shot),
+         (5000, s_drag_disabled_denied), (600, s_single_monitor_hint), (1000, s_disabled_row_fixed),
+         (600, s_drag_left), (900, s_drag_preview_shot),
          (1500, s_drag_anchor), (1200, s_reflow_on_scale),
          (900, s_apply_after_drag), (1800, s_keep_after_drag),
          (900, s_illegal_layout_refused), (1500, s_end)]

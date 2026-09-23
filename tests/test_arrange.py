@@ -81,26 +81,37 @@ class Snapping(unittest.TestCase):
         self.assertEqual(layout.snap_position(s, "eDP-1", (2100, 0)), (2048, 0))
 
 
-class Anchoring(unittest.TestCase):
-    def test_anchor_is_monitor_at_origin(self):
+class Normalizing(unittest.TestCase):
+    def test_dragging_dp3_past_edp_puts_edp_at_origin(self):
         _, _, s = two_on()
-        self.assertEqual(layout.anchor_name(s), "DP-3")
-
-    def test_dragging_the_anchor_moves_the_others(self):
-        _, _, s = two_on()
-        # drag DP-3 to the right of eDP-1: DP-3 stays at 0,0, eDP-1 goes left
         pos = layout.snap_position(s, "DP-3", (1920 + 2560, 0))
-        new = layout.moved(s, "DP-3", pos, "DP-3")
-        self.assertEqual(new["DP-3"]["position"], [0, 0])
-        self.assertEqual(new["eDP-1"]["position"], [-1920, 0])
+        new = layout.moved(s, "DP-3", pos)
+        self.assertEqual(new["eDP-1"]["position"], [0, 0])
+        self.assertEqual(new["DP-3"]["position"], [1920, 0])
         self.assertEqual(layout.arrangement_problems(new), [])
 
-    def test_moving_the_other_keeps_anchor(self):
+    def test_moving_above_keeps_everything_non_negative(self):
         _, _, s = two_on()
         pos = layout.snap_position(s, "eDP-1", (100, -2000))
-        new = layout.moved(s, "eDP-1", pos, "DP-3")
+        new = layout.moved(s, "eDP-1", pos)
+        self.assertEqual(new["eDP-1"]["position"], [100, 0])
+        self.assertEqual(new["DP-3"]["position"], [0, 1080])
+
+    def test_never_negative(self):
+        _, _, s = two_on()
+        for raw in [(-5000, -5000), (-1920, 500), (3000, -900), (400, 3000)]:
+            new = layout.moved(s, "eDP-1", layout.snap_position(s, "eDP-1", raw))
+            for st in new.values():
+                if st["enabled"]:
+                    self.assertGreaterEqual(min(st["position"]), 0, (raw, new))
+
+    def test_staggered_layout_box_corner_at_origin(self):
+        _, _, s = two_on()
+        s["eDP-1"]["position"] = [2560, 500]     # lower than DP-3's top
+        s["DP-3"]["position"] = [0, 100]          # both shifted down
+        new = layout.normalize(s)
         self.assertEqual(new["DP-3"]["position"], [0, 0])
-        self.assertEqual(new["eDP-1"]["position"][1], -1080)
+        self.assertEqual(new["eDP-1"]["position"], [2560, 400])
 
 
 class Reflow(unittest.TestCase):

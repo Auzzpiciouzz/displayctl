@@ -25,11 +25,18 @@ it. Disabled monitors can't be dragged (they have no position).
    edge (a shared edge segment of length > 0, not just a corner), and the
    whole layout is connected (you can walk from any monitor to any other
    across shared edges). A single monitor is trivially legal.
-3. **Anchor at 0,0**: one monitor stays at 0,0; after any change the whole
-   layout is shifted so the anchor is back there. The anchor is the monitor
-   at 0,0 in the live state (normally the one you use most), or else the
-   top-left-most enabled monitor. Dragging the anchor itself effectively
-   moves everything else the opposite way, like Windows.
+3. **Non-negative, starting at 0,0**: after any change the layout is shifted
+   so its bounding box starts at 0,0; no position is ever negative.
+   (Hyprland's docs allow negative positions, but X11 apps under XWayland
+   assume a root window starting at 0,0.) In a staggered layout the box's
+   corner is at 0,0 but no single monitor may be exactly there.
+
+**While dragging, only the dragged monitor moves**; everything else,
+including the row of disabled monitors, stays still on screen. The
+normalisation happens on release (the view then recentres).
+
+**One enabled monitor**: nothing to arrange; dragging is refused with the
+hint "Turn on another display to arrange them."
 
 ## Snapping (layout.snap_position)
 
@@ -47,7 +54,7 @@ pointer asks for. Output: the legal position closest to it.
 4. Pick the one nearest to the raw position. If none is legal (shouldn't
    happen), keep the old position.
 
-Then normalise (rule 3).
+Then (on release) normalise (rule 3).
 
 ## Size changes
 
@@ -70,10 +77,10 @@ Enabling a monitor already places it flush to the right of the layout.
 ## Status (2026-09-23)
 
 Built: layout.snap_position / moved / normalize / reflow_after_resize /
-arrangement_problems (15 unit tests in tests/test_arrange.py), canvas drag in
-gui.py (GestureDrag, frozen view, live snapped preview, pending on release),
-Apply refuses an illegal arrangement. Fake harness: 50/50. Not yet applied on
-real displays (manual test list in the commit).
+arrangement_problems (tests/test_arrange.py), canvas drag in gui.py
+(GestureDrag, frozen view, only the dragged monitor moves, disabled row
+fixed, single-monitor hint, one log summary per drag), Apply refuses an
+illegal arrangement. Fake harness 58/58. Not yet applied on real displays.
 
 Known limitation: because the view is frozen while dragging, a monitor
 dragged beyond the original layout's bounding box can reach the canvas edge;

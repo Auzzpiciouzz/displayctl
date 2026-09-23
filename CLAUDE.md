@@ -78,8 +78,9 @@ GTK); gui.py handles edits from GLib.idle_add.
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and blocks other tools),
   and don't use nwg-displays alongside (it's another output-management tool).
-1. Phase 3 step 4 manual tests (drag-to-arrange; list in the step-4 commit;
-   design in docs/drag-to-arrange.md).
+1. Phase 3 step 4 manual tests (drag-to-arrange; list in the latest drag
+   commit message; design in docs/drag-to-arrange.md). Positions are always
+   non-negative (layout normalised to 0,0 on release).
 2. Phase 4: rule-based dock switching in Lua on Hyprland (design in
    docs/hyprland-persistence.md), which also replaces kanshi.
 3. Upstream: docs/upstream-issue.md is a DRAFT; review before filing.

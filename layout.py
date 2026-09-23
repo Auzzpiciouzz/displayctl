@@ -270,29 +270,22 @@ def arrangement_problems(states):
     return problems
 
 
-def anchor_name(states):
-    """The monitor that stays at 0,0: the one there now, else the top-left-most."""
-    rects = enabled_rects(states)
-    if not rects:
-        return None
-    for name, (x, y, _w, _h) in rects.items():
-        if (x, y) == (0, 0):
-            return name
-    return min(rects, key=lambda n: (rects[n][0], rects[n][1], n))
+def normalize(states):
+    """Shift the enabled layout so its bounding box starts at 0,0 (new dicts).
 
-
-def normalize(states, anchor):
-    """Shift every enabled monitor so `anchor` is at 0,0 (new dicts).
-
-    If the anchor isn't enabled (any more), the top-left-most monitor is used.
+    Every position becomes non-negative, and the top-left-most monitor sits
+    at 0,0 whenever one monitor is both leftmost and topmost. (For a
+    staggered layout, e.g. one monitor lower than the other, the box's
+    corner is at 0,0 but no monitor exactly is.) Hyprland allows negative
+    positions, but non-negative ones are the safe choice for X11 apps under
+    XWayland, which assume a root window starting at 0,0.
     """
     rects = enabled_rects(states)
-    if anchor not in rects:
-        anchor = anchor_name(states)
-        if anchor is None:
-            return copy.deepcopy(states)
-    dx, dy = rects[anchor][0], rects[anchor][1]
     new = copy.deepcopy(states)
+    if not rects:
+        return new
+    dx = min(r[0] for r in rects.values())
+    dy = min(r[1] for r in rects.values())
     for name in rects:
         x, y = new[name]["position"]
         new[name]["position"] = [x - dx, y - dy]
@@ -322,7 +315,7 @@ def snap_position(states, name, raw, threshold=64):
     rx, ry = int(round(raw[0])), int(round(raw[1]))
     others = {n: r for n, r in enabled_rects(states).items() if n != name}
     if not others:
-        return (rx, ry)  # alone: anywhere (normalize puts it at 0,0)
+        return (rx, ry)  # alone: anywhere (normalize puts it back at 0,0)
     w, h = logical_size(states[name])
 
     def clamp(v, lo, hi):
@@ -342,9 +335,9 @@ def snap_position(states, name, raw, threshold=64):
     return min(legal, key=lambda c: ((c[0] - rx) ** 2 + (c[1] - ry) ** 2, c))
 
 
-def moved(states, name, pos, anchor):
-    """All states after moving `name` to `pos`, then re-anchoring."""
-    return normalize(_placed(states, name, pos), anchor)
+def moved(states, name, pos):
+    """All states after moving `name` to `pos`, then normalising to 0,0."""
+    return normalize(_placed(states, name, pos))
 
 
 def reflow_after_resize(before, after, name):
