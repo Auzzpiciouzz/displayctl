@@ -62,7 +62,7 @@ rules file describes mode, position, scale and transform, plus only these
 on/off rules: plain `disabled` for external monitors that were off, and the
 guarded disable for a laptop panel (see "Durable Keep").
 
-## Durable Keep: detailed design (2026-09-23, awaiting approval)
+## Durable Keep: detailed design (2026-09-23; approved, U1/U2 done, live tests pending)
 
 ### Files (all ours, in `~/.config/hypr/displayctl/`)
 
@@ -129,6 +129,22 @@ if ok and present == true then
 end
 ```
 
+**Undock/dock safety (added on review):** the guard above only runs when the
+config loads, so the file also registers `hl.on("monitor.added")` and
+`hl.on("monitor.removed")` handlers (only when it contains a guarded panel):
+- events for the laptop panel itself are ignored (the file switching the
+  panel on/off would otherwise trigger them);
+- for an external monitor, the guard is re-checked 1 s later (monitor list
+  settled; `hl.timer`, or immediately if timers aren't available), and the
+  config is reloaded (`hl.dispatch(hl.dsp.reload_config())`) only if the
+  answer differs from what this load applied;
+- no loops: right after a reload the answer equals what that load applied;
+  backstop: at most one reload per 5 s (timestamp in
+  `$XDG_RUNTIME_DIR/displayctl-reload-stamp`); a blocked check is postponed,
+  never dropped.
+So unplugging the external monitor brings the panel back (and plugging it in
+turns the panel off again). Implemented in durable.py (GUARD_TEMPLATE).
+
 Rules:
 - Monitors that were ON get a full rule (mode, position, scale, transform).
 - A laptop panel (eDP-*, LVDS-*, DSI-*) that was OFF gets only the guarded
@@ -163,6 +179,9 @@ Rules:
 The protocol-level safety (watchdog, 15 s dialog) has finished by then; the
 new layout was already live and confirmed, so the file only has to match it.
 
+Implementation: durable.py (generate_lua, kept_json, self_check, keep,
+undo, atomic_write). Not wired into the GUI/CLI yet.
+
 ### Revert after a durable Keep ("Undo last Keep")
 
 A separate action (CLI `displayctl.py undo`, later a GUI button): swap
@@ -171,8 +190,8 @@ restored JSON, then the same 15 s Keep/Revert question as any change; not
 confirming swaps back (so Undo of Undo = Redo). If the process crashes
 during that countdown there is no watchdog for file swaps (yet): the files
 are left in the swapped state, which is a layout that was confirmed once
-before. Proposal: accept that for now; extend the watchdog to file swaps
-later if needed.
+before. **Accepted for now** (2026-09-23); extend the watchdog to file
+swaps later if needed.
 
 ### Known limits
 
@@ -185,18 +204,24 @@ later if needed.
 
 ### Test plan (in this order; stop at anything unexpected)
 
-No real display changes:
-- **U1** Unit tests of the generator: Lua text run under local lua
-  5.4/5.5/LuaJIT with a mock `hl`: (a) docked, eDP-1 kept off -> DP-3 rule
-  + eDP-1 disabled; (b) undocked -> no eDP-1 disable; (c) a different
-  external connected -> no disable; (d) `get_monitors` raises / returns nil
-  / returns junk -> no disable; (e) eDP-1 kept on -> normal rule, no
-  guard; (f) quotes/backslashes in descriptions are escaped; (g) `luac -p`
-  syntax check.
-- **U2** Unit tests of the file handling in a temp dir: atomic write
-  (temp + rename, no partial file), first Keep creates the placeholder
-  `.prev`, second Keep moves the first to `.prev`, undo swaps, JSON
-  round-trip.
+No real display changes (**DONE 2026-09-23**: tests/test_durable.py, all
+pass; every Lua scenario runs under Lua 5.5, 5.4 and LuaJIT):
+- **U1** Generated Lua with a mock `hl`: (a) docked, eDP-1 kept off -> DP-3
+  rule + eDP-1 disabled + both handlers; (b) undocked -> no disable; (c) a
+  different monitor on the same port -> no disable; (d) `get_monitors`
+  raises / nil / junk / destroyed objects -> no disable; (e) eDP-1 kept on
+  -> normal rule, no guard, no handlers; (f) quotes, backslashes, newline,
+  tab in descriptions escaped and still matching; (g) `luac -p` on several
+  layouts; (h) external off -> plain disable, panel never unguarded;
+  scale 1.25 + rotation in rules. Handlers: (i) undock -> exactly 1 reload;
+  (j) dock -> 1 reload; (k) the panel's own events -> 0 reloads; (l) no
+  change -> no reload (no loop); (m) rate limit postpones, doesn't drop;
+  (n) no timers -> immediate check; (o) destroyed event object -> handled.
+- **U2** Files in a temp dir: first Keep creates the placeholder `.prev`;
+  second Keep moves the first to `.prev`; undo swaps (twice = redo); undo
+  without `.prev` refuses; JSON round-trip; a failed rename leaves the old
+  file and no temp file; self_check passes good files and catches an
+  unguarded panel disable and broken Lua, and refuses without a local lua.
 
 After you add the dofile line (expect eDP-1 to switch on when you save;
 each live step below checks both views and hyprctl configerrors):
@@ -220,9 +245,18 @@ each live step below checks both views and hyprctl configerrors):
   in its 15 s dialog -> swapped back, verified.
 - **L9** Restore baseline (DP-3 200 at 0,0, eDP-1 off) with a final Keep,
   so the file on disk matches it.
-- Optional, needs a log-out/in (your call): **L10** startup behaviour with
-  the file present (probe log at startup; expected: fail-safe eDP-1 on if
-  `get_monitors` is empty then).
+- **L11** (required before anything relies on the file for docking) With
+  eDP-1 kept off by the file and kanshi stopped, the user physically
+  unplugs the Samsung: the laptop panel must come on within a few seconds
+  (handler -> reload -> guard false). Then plug it back in: eDP-1 should
+  turn off again (dock handler). Checked in both views plus the Hyprland
+  log / reload stamp.
+- Optional, needs a log-out/in: **L10** startup behaviour with the file
+  present (probe log at startup; expected: fail-safe eDP-1 on if
+  `get_monitors` is empty then). kanshi autostarts at login and applies its
+  `external` profile (eDP-1 off), which would mask the file's effect, so
+  for L10 the `hl.exec_cmd("kanshi")` line in hyprland.lua should be
+  commented out temporarily (by the user) and restored afterwards.
 
 ## Open questions
 
