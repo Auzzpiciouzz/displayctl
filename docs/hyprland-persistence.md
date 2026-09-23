@@ -198,30 +198,42 @@ ignore the watchdog's revert. So the GUI passes its PID to the watchdog, and
 on its deadline the watchdog `kill -9`s it (after checking /proc that the PID
 is still gui.py), waits for it to exit, then reverts.
 
-### Open: does an idle applying client block everyone else? (hypothesis)
+### An idle applying client blocks everyone else (confirmed)
 
-2026-09-23 07:56: with the GUI still open after the manual tests (it had
-applied the last change, then sat idle), `displayctl.py set eDP-1 --enable`
-was answered "succeeded" but Hyprland did nothing: no modeset in its log,
-both views still "off". Consistent with T3 (another client's revert ignored
-while the applier is connected), but here the applier was idle and the
-blocked change was a new one, not a revert. NOT yet confirmed; test with the
-GUI closed vs. open. If true, it matters for Phase 4: an open GUI would
-block kanshi / the dock daemon.
+2026-09-23, nothing else connected, kanshi off, sampled fresh protocol reads
++ hyprctl every 0.3 s:
+- (a) no GUI open: `displayctl.py set eDP-1 --enable` (same-connection
+  revert after 5 s) worked: eDP-1 on, then off, stayed off.
+- (b) GUI applied DP-3 144 Hz, pressed Keep and sat idle: the same command
+  was answered "succeeded" but eDP-1 never came on (both views).
+So while a client that applied the last change stays connected, other
+clients' configurations are accepted and ignored. Matters for Phase 4: an
+open GUI blocks kanshi, displayctl and a dock daemon. (Also: displayctl
+doesn't verify its own apply, so it can't notice; it only verifies reverts.)
 
-### Reported bug: eDP-1 still on after a verified revert (test 9)
+### Root cause of test 9: the applying client gets the OLD state
 
-GUI: enable eDP-1 -> Apply -> Revert: "self-revert succeeded", "verify after
-revert: ok", yet the GUI's next refresh and hyprctl showed eDP-1 on. The
-Hyprland log shows eDP-1 disabled twice right after (true -> false, then
-another "Disabling output"). Root cause not yet found; the reproduction
-attempt was confounded by the open GUI (above). Mitigation in place: every
-revert is verified twice, 2 s apart (GUI and watchdog); a failed second
-check hands over to the watchdog.
+Traced through the real GUI path (hook: enable eDP-1 -> Apply -> Revert).
+The displays did the right thing (eDP-1 on at +0.5 s, off after Revert,
+stayed off). But on the GUI's own connection Hyprland sent, for each commit:
+`done` immediately, then with `succeeded()` the head state from BEFORE the
+commit (`enabled(0)` after enabling, `enabled(1)` after disabling), and
+nothing afterwards. So the applying client's view is one change behind.
+Fresh connections (verify, hyprctl, the CLI, the watchdog) see the truth.
+That's why "verify after revert: ok" was followed by a GUI refresh showing
+eDP-1 on. Not fixed yet (design decision pending).
 
-Unrelated find: `~/.config/hypr/monitors.lua` was written by nwg-displays at
-07:10 (eDP-1 disabled, DP-3 at 4480,0). It is NOT loaded by hyprland.lua, so
-it has no effect, but nwg-displays is one more output-management tool.
+### Crash and hang fallbacks (verified on real displays)
+
+- Test 8, GUI `kill -9` during the Keep dialog: the watchdog saw the pipe
+  close and restored 200 Hz within 0.3 s, verified twice.
+- Hang, GUI `SIGSTOP`ped during the dialog: at the watchdog's deadline
+  (35 s after "applied") it killed the frozen GUI, reverted, verified twice.
+  First attempt failed: the watchdog identified the GUI by "gui.py" in its
+  command line and refused to kill the test hook, and with the frozen
+  client connected Hyprland ignored its revert (REVERT FAILED, recovered by
+  hand). Fixed: it now identifies the process by PID + start time
+  (/proc/PID/stat field 22), recorded when the watchdog starts.
 
 ## Phase 4 design: rule-based dock switching on Hyprland
 

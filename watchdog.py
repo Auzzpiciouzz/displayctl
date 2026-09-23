@@ -20,7 +20,8 @@ Usage (normally only called by displayctl.py / gui.py):
 KILL_PID (the GUI passes its own PID): on Hyprland, a revert from another
 client is ignored while the client that applied the change is still
 connected. A GUI that HANGS keeps its connection open, so on a deadline
-the watchdog kill -9s it first; its connection then closes and the revert
+the watchdog kill -9s it first (only if the PID still has the start time it
+had when the watchdog started); its connection then closes and the revert
 works.
 Output goes to ~/.cache/displayctl/watchdog.log.
 """
@@ -135,22 +136,37 @@ def revert(snapshot):
     return False
 
 
-def kill_hung_client(pid):
+def process_start_time(pid):
+    """When process `pid` started (clock ticks since boot), or None if gone.
+
+    Field 22 of /proc/PID/stat. The command name (field 2) may contain spaces
+    or ')', so split after the LAST ')': what follows starts at field 3.
+    A PID can be reused by a new process later, but never with the same
+    start time, so (pid, start time) identifies one process for sure.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields_from_3 = f.read().rsplit(")", 1)[1].split()
+        return int(fields_from_3[22 - 3])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def kill_hung_client(pid, start_time):
     """kill -9 the (hung) GUI so its Wayland connection closes.
 
-    Checks /proc first that the PID still belongs to gui.py: PIDs get
-    reused, and we must never kill an unrelated process.
+    Only if `pid` is still the SAME process we were told about: its start
+    time must match the one recorded when the watchdog started. We must
+    never kill an unrelated process that happens to reuse the PID.
     """
     if pid is None:
         return
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            cmdline = f.read().replace(b"\0", b" ").decode(errors="replace")
-    except OSError:
+    now = process_start_time(pid)
+    if now is None:
         log(f"client {pid} is already gone")
         return
-    if "gui.py" not in cmdline:
-        log(f"not killing {pid}: it's not gui.py any more ({cmdline.strip()!r})")
+    if now != start_time:
+        log(f"not killing {pid}: that PID now belongs to a different process")
         return
     log(f"client {pid} didn't answer in time: kill -9 so its connection closes")
     try:
@@ -161,7 +177,7 @@ def kill_hung_client(pid):
     # Wait (up to 5 s) until it's really gone, so the compositor has seen the
     # connection close before we revert.
     for _ in range(50):
-        if not os.path.exists(f"/proc/{pid}"):
+        if process_start_time(pid) != start_time:
             break
         time.sleep(0.1)
     time.sleep(0.3)
@@ -170,6 +186,8 @@ def kill_hung_client(pid):
 def main():
     snapshot_path, confirm_seconds = sys.argv[1], float(sys.argv[2])
     kill_pid = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    # Remember which process that PID is right now (see kill_hung_client).
+    kill_start = process_start_time(kill_pid) if kill_pid else None
     with open(snapshot_path) as f:
         snapshot = json.load(f)
     log(f"started, snapshot {snapshot_path}")
@@ -188,11 +206,11 @@ def main():
             log("revert requested before confirmation")
             return 0 if revert(snapshot) else 1
         if cmd == "EOF":
-            log("displayctl exited before confirming -> reverting")
+            log("client (displayctl or GUI) exited before confirming -> reverting")
             return 0 if revert(snapshot) else 1
         if cmd is None:
             log("no 'applied' before timeout -> reverting")
-            kill_hung_client(kill_pid)
+            kill_hung_client(kill_pid, kill_start)
             return 0 if revert(snapshot) else 1
         log(f"ignoring unknown command {cmd!r}")
 
@@ -207,10 +225,10 @@ def main():
         if cmd == "revert":
             log("not confirmed -> reverting")
         elif cmd == "EOF":
-            log("displayctl exited without confirming -> reverting")
+            log("client (displayctl or GUI) exited without confirming -> reverting")
         elif cmd is None:
             log("confirmation deadline passed -> reverting")
-            kill_hung_client(kill_pid)
+            kill_hung_client(kill_pid, kill_start)
         else:
             log(f"ignoring unknown command {cmd!r}")
             continue

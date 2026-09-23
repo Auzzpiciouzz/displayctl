@@ -69,9 +69,10 @@ GTK); gui.py handles edits from GLib.idle_add.
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and fights displayctl),
   and don't use nwg-displays alongside (it's another output-management tool).
-1. Test 9 bug (eDP-1 on after a verified revert): reproduce with NO GUI
-   open, WAYLAND_DEBUG on; then test the "idle applier blocks everyone"
-   hypothesis (docs/hyprland-persistence.md). Close the GUI before tests.
+1. Decide the fix for the GUI's stale view (Hyprland sends the applying
+   client the pre-commit state; see docs, "Root cause of test 9") and for
+   "an idle applying client blocks everyone" (e.g. GUI closes/reopens its
+   connection after Keep?). Report-first: not implemented yet.
 2. Phase 3 step 4: drag-to-arrange (position editing) on the canvas.
 3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
    docs/hyprland-persistence.md; open points listed there).
