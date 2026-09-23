@@ -14,14 +14,21 @@ terminal doesn't reach it), it still reverts when displayctl.py goes wrong:
   displayctl.py crashes or is killed -> the pipe closes (EOF)   -> revert now
   displayctl.py hangs                 -> no message by deadline -> revert
 
-Usage (normally only called by displayctl.py):
-  watchdog.py SNAPSHOT.json CONFIRM_SECONDS
+Usage (normally only called by displayctl.py / gui.py):
+  watchdog.py SNAPSHOT.json CONFIRM_SECONDS [KILL_PID]
+
+KILL_PID (the GUI passes its own PID): on Hyprland, a revert from another
+client is ignored while the client that applied the change is still
+connected. A GUI that HANGS keeps its connection open, so on a deadline
+the watchdog kill -9s it first; its connection then closes and the revert
+works.
 Output goes to ~/.cache/displayctl/watchdog.log.
 """
 
 import json
 import os
 import select
+import signal
 import sys
 import time
 
@@ -111,16 +118,58 @@ def revert(snapshot):
         except WaylandError as e:
             problems = [f"could not re-read outputs: {e}"]
         if not problems:
-            log("revert verified: outputs match the snapshot")
-            return True
+            # Check once more a bit later: enabling/disabling outputs can make
+            # Hyprland re-apply its config rules a moment afterwards.
+            time.sleep(2)
+            try:
+                problems = verify(desired)
+            except WaylandError as e:
+                problems = [f"could not re-read outputs: {e}"]
+            if not problems:
+                log("revert verified (checked twice): outputs match the snapshot")
+                return True
+            log("revert looked fine, but a second check 2 s later disagrees:")
         for p in problems:
             log(f"  verify mismatch: {p}")
     log("!!! REVERT FAILED: outputs still don't match the snapshot after 2 tries !!!")
     return False
 
 
+def kill_hung_client(pid):
+    """kill -9 the (hung) GUI so its Wayland connection closes.
+
+    Checks /proc first that the PID still belongs to gui.py: PIDs get
+    reused, and we must never kill an unrelated process.
+    """
+    if pid is None:
+        return
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        log(f"client {pid} is already gone")
+        return
+    if "gui.py" not in cmdline:
+        log(f"not killing {pid}: it's not gui.py any more ({cmdline.strip()!r})")
+        return
+    log(f"client {pid} didn't answer in time: kill -9 so its connection closes")
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as e:
+        log(f"kill failed: {e}")
+        return
+    # Wait (up to 5 s) until it's really gone, so the compositor has seen the
+    # connection close before we revert.
+    for _ in range(50):
+        if not os.path.exists(f"/proc/{pid}"):
+            break
+        time.sleep(0.1)
+    time.sleep(0.3)
+
+
 def main():
     snapshot_path, confirm_seconds = sys.argv[1], float(sys.argv[2])
+    kill_pid = int(sys.argv[3]) if len(sys.argv) > 3 else None
     with open(snapshot_path) as f:
         snapshot = json.load(f)
     log(f"started, snapshot {snapshot_path}")
@@ -143,6 +192,7 @@ def main():
             return 0 if revert(snapshot) else 1
         if cmd is None:
             log("no 'applied' before timeout -> reverting")
+            kill_hung_client(kill_pid)
             return 0 if revert(snapshot) else 1
         log(f"ignoring unknown command {cmd!r}")
 
@@ -160,6 +210,7 @@ def main():
             log("displayctl exited without confirming -> reverting")
         elif cmd is None:
             log("confirmation deadline passed -> reverting")
+            kill_hung_client(kill_pid)
         else:
             log(f"ignoring unknown command {cmd!r}")
             continue

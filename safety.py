@@ -41,15 +41,20 @@ def take_lock():
     return lock
 
 
-def start_watchdog(lock, confirm_seconds):
+def start_watchdog(lock, confirm_seconds, kill_pid=None):
     """Launch watchdog.py with a pipe to its stdin. Returns the Popen object.
 
     confirm_seconds: how long the caller may take to say "keep" or "revert"
     after "applied"; the watchdog adds its own grace period on top.
+    kill_pid: the GUI passes its PID, so a hung GUI can be killed on the
+    deadline (see watchdog.py).
     """
     log = open(WATCHDOG_LOG, "a")
+    args = [sys.executable, str(HERE / "watchdog.py"), str(LAST_GOOD), str(confirm_seconds)]
+    if kill_pid is not None:
+        args.append(str(kill_pid))
     return subprocess.Popen(
-        [sys.executable, str(HERE / "watchdog.py"), str(LAST_GOOD), str(confirm_seconds)],
+        args,
         stdin=subprocess.PIPE,
         stdout=log,
         stderr=subprocess.STDOUT,

@@ -190,13 +190,38 @@ serial is fresh after dispatching), show the user the new layout, and let
 them retry. Don't retry automatically: the layout they edited may no longer
 make sense.
 
-### Known gap: a GUI that hangs (not crashes)
+### A GUI that hangs (not crashes)
 
 If gui.py crashes or is closed, its connection closes and the watchdog's
-revert works. If it HANGS with the connection still open, the watchdog's
-revert is sent but ignored by Hyprland (only the applying client can revert
-while it's connected). Its verify then fails and it logs a loud error. A
-hang during the 15 s dialog is the remaining unprotected case.
+revert works. If it HANGS with the connection still open, Hyprland would
+ignore the watchdog's revert. So the GUI passes its PID to the watchdog, and
+on its deadline the watchdog `kill -9`s it (after checking /proc that the PID
+is still gui.py), waits for it to exit, then reverts.
+
+### Open: does an idle applying client block everyone else? (hypothesis)
+
+2026-09-23 07:56: with the GUI still open after the manual tests (it had
+applied the last change, then sat idle), `displayctl.py set eDP-1 --enable`
+was answered "succeeded" but Hyprland did nothing: no modeset in its log,
+both views still "off". Consistent with T3 (another client's revert ignored
+while the applier is connected), but here the applier was idle and the
+blocked change was a new one, not a revert. NOT yet confirmed; test with the
+GUI closed vs. open. If true, it matters for Phase 4: an open GUI would
+block kanshi / the dock daemon.
+
+### Reported bug: eDP-1 still on after a verified revert (test 9)
+
+GUI: enable eDP-1 -> Apply -> Revert: "self-revert succeeded", "verify after
+revert: ok", yet the GUI's next refresh and hyprctl showed eDP-1 on. The
+Hyprland log shows eDP-1 disabled twice right after (true -> false, then
+another "Disabling output"). Root cause not yet found; the reproduction
+attempt was confounded by the open GUI (above). Mitigation in place: every
+revert is verified twice, 2 s apart (GUI and watchdog); a failed second
+check hands over to the watchdog.
+
+Unrelated find: `~/.config/hypr/monitors.lua` was written by nwg-displays at
+07:10 (eDP-1 disabled, DP-3 at 4480,0). It is NOT loaded by hyprland.lua, so
+it has no effect, but nwg-displays is one more output-management tool.
 
 ## Phase 4 design: rule-based dock switching on Hyprland
 

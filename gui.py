@@ -28,7 +28,9 @@ What Apply does (see Applier)
           verify. The watchdog is only the fallback if the GUI crashes.
 """
 
+import ctypes
 import logging
+import os
 import select
 import sys
 
@@ -52,6 +54,9 @@ CONFIRM_SECONDS = 15  # the "Keep these display settings?" countdown
 # The watchdog must not act while the GUI is still deciding or reverting:
 # its deadline is CONFIRM_SECONDS + this (+ its own grace period).
 WATCHDOG_EXTRA_SECONDS = 15
+# After a revert verifies OK, check again this much later: turning outputs
+# on/off can make Hyprland re-apply its config rules a moment afterwards.
+REVERIFY_SECONDS = 2
 
 ROTATION_NAMES = {0: "Normal", 1: "90°", 2: "180°", 3: "270°", 4: "Flipped",
                   5: "Flipped, 90°", 6: "Flipped, 180°", 7: "Flipped, 270°"}
@@ -505,7 +510,10 @@ class Applier:
             # Snapshot, then arm the watchdog BEFORE applying.
             self.snapshot = self.om.snapshot()
             backend.save_json(backend.LAST_GOOD, self.snapshot)
-            self.watchdog = safety.start_watchdog(lock, CONFIRM_SECONDS + WATCHDOG_EXTRA_SECONDS)
+            # Our PID: if we hang, the watchdog kills us on its deadline so our
+            # connection closes and its revert works (see watchdog.py).
+            self.watchdog = safety.start_watchdog(
+                lock, CONFIRM_SECONDS + WATCHDOG_EXTRA_SECONDS, kill_pid=os.getpid())
         except OSError as e:
             self._finish()
             self.window.alert("Can't apply", f"Couldn't save the snapshot or start the watchdog: {e}")
@@ -546,6 +554,8 @@ class Applier:
     def _verify_then_ask(self):
         problems, _ = backend.verify_state(self.desired, settle=0)
         log.debug("verify after apply: %s", problems or "ok")
+        # Log (and show) the live state our own connection reports during the hold.
+        self.window.refresh()
         self._ask(problems)
         return GLib.SOURCE_REMOVE
 
@@ -621,9 +631,14 @@ class Applier:
         log.debug("self-revert result: %s", result)
         GLib.timeout_add(1000, self._verify_revert, desired)
 
-    def _verify_revert(self, desired):
+    def _verify_revert(self, desired, second_check=False):
         problems, _ = backend.verify_state(desired, settle=0)
-        log.debug("verify after revert: %s", problems or "ok")
+        log.debug("verify after revert%s: %s", " (second check)" if second_check else "",
+                  problems or "ok")
+        if not problems and not second_check:
+            # Looks right; check once more a bit later before trusting it.
+            GLib.timeout_add(REVERIFY_SECONDS * 1000, self._verify_revert, desired, True)
+            return GLib.SOURCE_REMOVE
         if not problems:
             safety.tell(self.watchdog, "keep")  # already restored: nothing left to do
             self._finish()
@@ -842,11 +857,29 @@ class DisplayctlApp(Adw.Application):
             self.om.close()
 
 
+def drop_vk_suboptimal(level, fields, *_user_data):
+    """GLib log writer that drops GDK's harmless VK_SUBOPTIMAL_KHR warnings.
+
+    (They appear when a monitor's mode changes under a Vulkan surface; GTK
+    recreates the swapchain and carries on.) Everything else goes to GLib's
+    default writer. Each field's value is a raw C pointer; length -1 means
+    a NUL-terminated string, readable with ctypes while we're called.
+    """
+    for f in fields:
+        if f.key == "MESSAGE" and f.length == -1 and f.value:
+            if b"VK_SUBOPTIMAL_KHR" in ctypes.string_at(f.value):
+                return GLib.LogWriterOutput.HANDLED
+    return GLib.log_writer_default(level, fields, None)
+
+
 if __name__ == "__main__":
     # Our own flag, removed before GTK sees argv (it rejects unknown options).
     argv = [a for a in sys.argv if a != "--debug"]
+    debug = len(argv) != len(sys.argv)
     logging.basicConfig(
-        level=logging.DEBUG if len(argv) != len(sys.argv) else logging.WARNING,
+        level=logging.DEBUG if debug else logging.WARNING,
         format="%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S",
     )
+    if debug:
+        GLib.log_set_writer_func(drop_vk_suboptimal)
     sys.exit(DisplayctlApp().run(argv))

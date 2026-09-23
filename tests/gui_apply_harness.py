@@ -29,8 +29,8 @@ class FakeWatchdog:
     def flush(self): pass
     def poll(self): return 0
 watchdogs = []
-def fake_start_watchdog(lock, seconds):
-    w = FakeWatchdog(); w.seconds = seconds; watchdogs.append(w); return w
+def fake_start_watchdog(lock, seconds, kill_pid=None):
+    w = FakeWatchdog(); w.seconds = seconds; w.kill_pid = kill_pid; watchdogs.append(w); return w
 safety.start_watchdog = fake_start_watchdog
 
 applied = []            # (action, desired) the GUI tried to send
@@ -48,6 +48,10 @@ real_disagreements = backend.hyprland_disagreements
 
 import logging; logging.basicConfig(level=logging.DEBUG, format="%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S"); logging.getLogger("displayctl.gui").setLevel(logging.DEBUG)
 app = gui.DisplayctlApp()
+# Run as a separate instance even if the real GUI is open (same app ID):
+# otherwise GTK would just activate the running GUI and exit.
+from gi.repository import Gio
+app.set_flags(app.get_flags() | Gio.ApplicationFlags.NON_UNIQUE)
 W = lambda: app.window
 
 def geo():
@@ -142,6 +146,7 @@ def s_apply_keep():
     wd = watchdogs[-1]
     check("apply sent ONE full config with every head", applied[-1][0] == "apply" and set(applied[-1][1]) == {"DP-3", "eDP-1"})
     check("watchdog armed with extended deadline", wd.seconds == gui.CONFIRM_SECONDS + gui.WATCHDOG_EXTRA_SECONDS)
+    check("watchdog knows the GUI's PID (to kill it if hung)", wd.kill_pid == os.getpid())
     check("watchdog told 'applied'", wd.cmds == ["applied"], wd.cmds)
     check("busy: editing disabled", W().applier.busy and not W().details.get_sensitive())
     return False
@@ -159,7 +164,7 @@ def s_keep_dialog_shown():
 
 def s_apply_timeout():
     select("DP-3"); pick("refresh", "143.999 Hz")
-    verify_results[:] = [[], []]   # apply verify ok, revert verify ok
+    verify_results[:] = [[], [], []]   # apply verify, revert verify, revert re-verify
     W().apply_button.emit("clicked")
     return False
 def s_after_timeout():
@@ -173,7 +178,7 @@ def s_after_timeout():
 
 def s_apply_esc():
     select("DP-3"); pick("refresh", "143.999 Hz")
-    verify_results[:] = [[], []]
+    verify_results[:] = [[], [], []]
     W().apply_button.emit("clicked"); return False
 def s_press_esc():
     d = dialog(); d.close()   # like Esc: triggers the close response ("revert")
@@ -185,7 +190,7 @@ def s_after_esc():
 
 def s_apply_failed():
     select("DP-3"); pick("refresh", "143.999 Hz")
-    apply_results[:] = ["failed", "succeeded"]; verify_results[:] = [[]]
+    apply_results[:] = ["failed", "succeeded"]; verify_results[:] = [[], []]
     n = len(applied); W().apply_button.emit("clicked")
     check("failed apply triggers an immediate self-revert", len(applied) == n + 2 and applied[-1][1]["DP-3"]["mode"]["refresh_mhz"] == 200000)
     return False
@@ -204,11 +209,27 @@ def s_apply_cancelled():
     d = W().get_visible_dialog(); d and d.force_close()
     return False
 
+def s_second_check_catches_late_change():
+    # like the reported bug: revert verifies OK, but 2 s later the state is wrong
+    select("DP-3"); pick("refresh", "143.999 Hz")
+    verify_results[:] = [[], [], ["eDP-1: enabled True (want False)"]]
+    global old_om2; old_om2 = app.om
+    W().apply_button.emit("clicked")
+    GLib.timeout_add(1300, lambda: (dialog().emit("response", "revert"), False)[1])
+    return False
+def s_after_second_check():
+    wd = watchdogs[-1]
+    check("second check catches a late re-enable -> handover to watchdog",
+          wd.cmds == ["applied", "revert"] and old_om2.display._ptr is None, wd.cmds)
+    app.om.run_configuration = fake_run_configuration
+    return False
+
 def s_revert_fails_handover():
     # revert verify fails -> GUI must disconnect, hand over to watchdog, reconnect
     verify_results[:] = [[], ["DP-3: mode 2560x1440@143999 (want 2560x1440@200000)"]]
     old_om = app.om
     W().apply_button.emit("clicked")
+    select("DP-3"); pick("refresh", "143.999 Hz")
     GLib.timeout_add(1300, lambda: (dialog().emit("response", "revert"), False)[1])
     GLib.timeout_add(3500, lambda: after_handover(old_om))
     return False
@@ -228,10 +249,11 @@ def s_end():
 steps = [(1500, s_start), (1200, s_guard_all_off), (1200, s_enable_edp_then_off_dp3),
          (1200, s_crosscheck_refuses), (900, s_close_alert),
          (500, s_apply_keep), (1600, s_keep_dialog_shown),
-         (600, s_apply_timeout), (8000, s_after_timeout),
-         (600, s_apply_esc), (1800, s_press_esc), (1800, s_after_esc),
-         (600, s_apply_failed), (1800, s_after_failed),
+         (600, s_apply_timeout), (10000, s_after_timeout),
+         (600, s_apply_esc), (1800, s_press_esc), (3800, s_after_esc),
+         (600, s_apply_failed), (3800, s_after_failed),
          (600, s_apply_cancelled),
+         (800, s_second_check_catches_late_change), (6500, s_after_second_check),
          (800, s_revert_fails_handover), (5000, s_end)]
 
 def run(i=0):
