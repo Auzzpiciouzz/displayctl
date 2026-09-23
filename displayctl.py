@@ -28,6 +28,7 @@ import time
 import tty
 from pathlib import Path
 
+import durable
 from backend import (
     LAST_GOOD, TRANSFORM_BY_NAME, TRANSFORMS,
     OutputManager, WaylandError, desired_from_snapshot, hyprland_disagreements,
@@ -69,6 +70,99 @@ def describe(state):
         f"{mode}  pos {x},{y}  scale {state['scale']:g}  "
         f"transform {TRANSFORMS.get(state['transform'], state['transform'])}"
     )
+
+
+# --- durable Keep (docs/hyprland-persistence.md, "Durable Keep") ----------------
+
+
+def make_durable():
+    """After a verified Keep: write the live layout to our monitors.lua.
+
+    Only on Hyprland with the user's dofile line in hyprland.lua. Returns
+    True if the layout is now durable.
+    """
+    if not on_hyprland():
+        return False
+    if not durable.dofile_line_present():
+        print("Not made permanent: hyprland.lua doesn't load "
+              f"{durable.DIR / durable.LUA_NAME} (see docs/hyprland-persistence.md).")
+        return False
+    states = durable_live_states()
+    problems = durable.persist(states)
+    if problems:
+        print("NOT made permanent:")
+        for p in problems:
+            print(f"  {p}")
+        return False
+    print("Made permanent: the rules in monitors.lua reproduce this layout (verified).")
+    return True
+
+
+def durable_live_states():
+    with OutputManager() as om:
+        return {h.name: h.to_state() for h in om.heads}
+
+
+def cmd_persist(args):
+    """Write the CURRENT layout as durable rules (used by the GUI after Keep)."""
+    # The GUI starts us right after telling its watchdog "keep"; the
+    # watchdog may still hold the lock for a moment while it exits.
+    for _ in range(50):
+        try:
+            lock = safety.take_lock()
+            break
+        except LockBusy:
+            time.sleep(0.1)
+    else:
+        die("another display change is still pending; not made permanent")
+    try:
+        sys.exit(0 if make_durable() else 1)
+    finally:
+        lock.close()
+
+
+def cmd_undo(args):
+    """Undo the last durable Keep: swap monitors.lua and .prev, reload, verify,
+    then the usual 15 s question; not confirming swaps back."""
+    if not on_hyprland() or not durable.dofile_line_present():
+        die("durable Keep isn't set up (Hyprland with the dofile line in hyprland.lua)")
+    lock = take_lock()
+    try:
+        try:
+            durable.undo()
+        except FileNotFoundError as e:
+            die(str(e))
+        print("Restored the previous monitors.lua; reloading Hyprland")
+        durable.reload_hyprland()
+        problems = durable.verify_durable(durable.load_json())
+        if problems:
+            print("The previous rules didn't produce their layout: " + "; ".join(problems))
+            keep = False
+        elif args.auto_keep:
+            print("--auto-keep: keeping")
+            keep = True
+        elif args.auto_revert_after is not None:
+            print(f"--auto-revert-after: holding for {args.auto_revert_after}s, then reverting")
+            time.sleep(args.auto_revert_after)
+            keep = False
+        else:
+            try:
+                keep = confirm(CONFIRM_SECONDS)
+            except KeyboardInterrupt:
+                print()
+                keep = False
+        if keep:
+            print("Kept the previous layout (undo again to redo).")
+            return
+        print("Swapping back")
+        durable.undo()
+        durable.reload_hyprland()
+        back = durable.verify_durable(durable.load_json())
+        if back:
+            die("SWAP BACK DIDN'T VERIFY: " + "; ".join(back))
+        print("Back to the layout before the undo (verified).")
+    finally:
+        lock.close()
 
 
 def cmd_list(args):
@@ -424,6 +518,7 @@ def cmd_set(args):
             # compositor's update events had arrived).
             with OutputManager() as fresh:
                 print(f"Kept. {target}: {describe(fresh.head(target).to_state())}")
+            make_durable()
         else:
             tell(watchdog, "revert")
             wait_for_revert(watchdog)
@@ -500,6 +595,10 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list", help="show outputs and their modes (read-only)")
+    sub.add_parser("persist", help="write the current layout as permanent Hyprland rules")
+    u = sub.add_parser("undo", help="undo the last permanent Keep (with the 15 s question)")
+    u.add_argument("--auto-keep", action="store_true", help=argparse.SUPPRESS)
+    u.add_argument("--auto-revert-after", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
 
     p = sub.add_parser("set", help="change one output, with test + 15s auto-revert")
     p.add_argument("output", help="output name, e.g. DP-3 or eDP-1")
@@ -530,6 +629,10 @@ def main():
     try:
         if args.command == "list":
             cmd_list(args)
+        elif args.command == "persist":
+            cmd_persist(args)
+        elif args.command == "undo":
+            cmd_undo(args)
         else:
             cmd_set(args)
     except WaylandError as e:

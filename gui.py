@@ -34,17 +34,19 @@ import os
 import select
 import signal
 import sys
+from pathlib import Path
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import Adw, GLib, GLibUnix, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Adw, Gio, GLib, GLibUnix, Gtk, Pango, PangoCairo  # noqa: E402
 
 # Imported as modules (backend.x, safety.x) rather than names, so the test
 # harness can swap in fakes and exercise Apply without touching the displays.
 import backend  # noqa: E402
+import durable  # noqa: E402
 import layout  # noqa: E402
 import safety  # noqa: E402
 from backend import OutputManager, WaylandError  # noqa: E402
@@ -738,6 +740,7 @@ class Applier:
             safety.tell(self.watchdog, "keep")
             self._end_transaction()
             self.window.toast("Display settings kept")
+            self.window.app.persist_async()
         else:
             self._revert()
 
@@ -1014,6 +1017,7 @@ class DisplayctlApp(Adw.Application):
         self.om = None
         self.source = None
         self.window = None
+        self.persist_result = None  # None / "running" / (ok, output) of the last persist
         self.connect("shutdown", self._on_shutdown)
 
     def do_activate(self):
@@ -1051,6 +1055,38 @@ class DisplayctlApp(Adw.Application):
         log.debug("reconnecting (ends 'last applier' status, fresh state)")
         self._disconnect()
         self._connect()
+
+    def persist_async(self):
+        """After Keep: make the layout permanent (docs: "Durable Keep").
+
+        Runs `displayctl.py persist` as a separate process: it writes our
+        monitors.lua, reloads Hyprland once and verifies (a few seconds), so
+        the window stays responsive and our process needs no second Wayland
+        connection. Only on Hyprland with the user's dofile line present.
+        """
+        if not backend.on_hyprland() or not durable.dofile_line_present():
+            log.debug("persist skipped (not Hyprland, or hyprland.lua doesn't load our file)")
+            return
+        self.persist_result = "running"  # for tests and --debug
+        self.window.toast("Making the layout permanent…")
+        script = str(Path(__file__).resolve().parent / "displayctl.py")
+        proc = Gio.Subprocess.new(
+            [sys.executable, script, "persist"],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+
+        def finished(proc, result):
+            _, out, _ = proc.communicate_utf8_finish(result)
+            ok = proc.get_successful()
+            self.persist_result = (ok, out or "")
+            log.debug("persist %s:\n%s", "ok" if ok else "FAILED", (out or "").strip())
+            if ok:
+                self.window.toast("Layout saved: it will survive a Hyprland reload")
+            else:
+                self.window.alert("Couldn't make the layout permanent",
+                                  "The change is live, but a Hyprland reload would undo it.\n\n"
+                                  + (out or "").strip())
+
+        proc.communicate_utf8_async(None, None, finished)
 
     def handover_to_watchdog(self, watchdog, done):
         """Disconnect, let the watchdog revert, reconnect, then done(exit_code).

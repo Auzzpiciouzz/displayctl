@@ -447,3 +447,107 @@ def load_json(directory=DIR, prev=False):
     _, _, js, js_prev = _paths(directory)
     p = js_prev if prev else js
     return json.loads(p.read_text()) if p.exists() else None
+
+
+# --- Hyprland side: descriptions, reload, verification ---------------------------
+# (Live tests 2026-09-23: our dofile'd file is NOT auto-reloaded when written,
+#  so we reload explicitly, exactly once; `hyprctl reload` works with the Lua
+#  config and doesn't re-run hyprland.start autostarts.)
+
+HYPRLAND_LUA = Path.home() / ".config" / "hypr" / "hyprland.lua"
+
+
+def dofile_line_present(config=HYPRLAND_LUA, directory=DIR):
+    """True if hyprland.lua loads our file (read-only check; we never edit it)."""
+    try:
+        text = Path(config).read_text()
+    except OSError:
+        return False
+    target = str(Path(directory) / LUA_NAME)
+    return any("dofile" in line and target in line and not line.strip().startswith("--")
+               for line in text.splitlines())
+
+
+def _hyprctl_json(*args):
+    return json.loads(subprocess.check_output(["hyprctl", *args, "-j"], timeout=10))
+
+
+def hyprland_descriptions():
+    """{name: description} exactly as Hyprland's Lua sees them."""
+    return {m["name"]: m["description"] for m in _hyprctl_json("monitors", "all")}
+
+
+def reload_hyprland():
+    out = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=10)
+    if out.returncode != 0 or out.stdout.strip() != "ok":
+        raise RuntimeError(f"hyprctl reload failed: {out.stdout.strip()} {out.stderr.strip()}")
+
+
+def config_errors():
+    out = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=10)
+    return out.stdout.strip()
+
+
+def expected_after_reload(data):
+    """What the rules in `data` should produce right now: {name: state}.
+
+    Monitors without a definite rule (a guarded panel whose kept-with monitor
+    isn't on, or everything for the no-rules placeholder) are left out: the
+    catch-all decides them.
+    """
+    if not data or data.get("states") is None:
+        return {}
+    on_now = {m["description"] for m in _hyprctl_json("monitors")}  # only monitors that are on
+    guard_fires = any(d in on_now for d in data.get("kept_with", []))
+    return {n: s for n, s in data["states"].items()
+            if not (n in data.get("guarded_panels", []) and not guard_fires)}
+
+
+def verify_durable(data, settle=1.0):
+    """Problems after a reload ([] = the rules produced the expected layout).
+
+    Checked twice (settle, then 2 s later), plus: protocol and hyprctl agree,
+    and Hyprland reports no config errors.
+    """
+    import backend  # here: durable.py's file logic stays importable without Wayland
+    problems = []
+    for delay in (settle, 2.0):
+        expected = expected_after_reload(data)
+        p, missing = backend.verify_state(expected, settle=delay)
+        with backend.OutputManager() as om:
+            p += backend.hyprland_disagreements(om.heads) or []
+        if p:
+            problems = p
+            break
+    errors = config_errors()
+    if errors:
+        problems.append(f"Hyprland config errors: {errors}")
+    return problems
+
+
+def persist(states, directory=DIR, log=print):
+    """Make `states` (the layout that was just kept) durable. Returns problems.
+
+    generate -> self-check -> keep (.prev) -> one reload -> verify; on failure
+    swap back, reload, verify, and report both.
+    """
+    if not dofile_line_present(directory=directory):
+        return [f"hyprland.lua doesn't load {Path(directory) / LUA_NAME}; not made durable"]
+    desc = hyprland_descriptions()
+    text, data = generate_lua(states, desc), kept_json(states, desc)
+    problems = self_check(text, data)
+    if problems:
+        return ["generated file failed its self-check, nothing written: " + "; ".join(problems)]
+    keep(text, data, directory)
+    log(f"Wrote {Path(directory) / LUA_NAME} (previous version: {LUA_NAME}.prev); reloading Hyprland")
+    reload_hyprland()
+    problems = verify_durable(data)
+    if not problems:
+        return []
+    log("The new rules didn't produce the kept layout; restoring the previous file")
+    undo(directory)
+    reload_hyprland()
+    back = verify_durable(load_json(directory))
+    return (["new rules didn't match: " + "; ".join(problems)]
+            + (["AND the restored previous rules don't match either: " + "; ".join(back)] if back else
+               ["previous rules restored and verified"]))

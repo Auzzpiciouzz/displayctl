@@ -61,6 +61,11 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   disagree.
 - A leftover test monitors.lua once made reverts look broken: check for stray
   monitor rules before debugging "revert didn't take".
+- Durable Keep (durable.py): Keep writes ~/.config/hypr/displayctl/monitors.lua
+  (loaded by `pcall(dofile, ...)` at the end of hyprland.lua), then ONE
+  `hyprctl reload`, then verifies. Hyprland does NOT auto-reload our dofile'd
+  file; `hyprctl reload` re-applies rules but not the hyprland.start autostarts.
+  Layouts now survive reloads. `displayctl.py persist` / `undo`.
 
 ## Stack
 Python 3, PyGObject (GTK4 + libadwaita), pywayland.
@@ -81,11 +86,10 @@ GTK); gui.py handles edits from GLib.idle_add.
 1. DONE 2026-09-23: drag-to-arrange tests 2–8 passed live on the real GUI
    (tests/gui_live_arrange.py, 41/41 checks + SIGINT test; DP-3 returns to
    0,0 when eDP-1 is turned off; 15 s timeout measured 15.006 s).
-2. Make "Keep" durable: write the kept layout to our own monitors.lua
-   (design in docs/hyprland-persistence.md: protocol = preview,
-   monitors.lua = keep; our file is ~/.config/hypr/displayctl/monitors.lua,
-   NOT ~/.config/hypr/monitors.lua, which nwg-displays wrote; never disable
-   eDP-1 in it; revert = restore previous file + reload + verify).
+2. Durable Keep: implemented; U1/U2 + L1-L9 passed. PENDING (need the user):
+   L11 physical unplug of the Samsung with eDP-1 kept off (panel must come
+   on within seconds) — REQUIRED before relying on the file for docking;
+   L10 login test (comment out hl.exec_cmd("kanshi") temporarily).
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.

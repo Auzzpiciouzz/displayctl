@@ -43,6 +43,11 @@ def fake_run_configuration(desired, action):
 # each of them must be fake too.
 backend.OutputManager.run_configuration = lambda self, desired, action: fake_run_configuration(desired, action)
 
+# Never make anything durable from the fake harness: that would write the real
+# ~/.config/hypr/displayctl/monitors.lua and reload Hyprland.
+persist_calls = []
+gui.DisplayctlApp.persist_async = lambda self: persist_calls.append(1)
+
 verify_results = []     # scripted verify_state results (problem lists)
 def fake_verify(desired, settle=1.0):
     return (verify_results.pop(0) if verify_results else [], [])
@@ -168,6 +173,7 @@ def s_keep_dialog_shown():
     wd = watchdogs[-1]
     check("Keep: watchdog stands down", wd.cmds == ["applied", "keep"], wd.cmds)
     check("Keep: pending cleared, not busy", W().pending == {} and not W().applier.busy)
+    check("Keep asks for the layout to be made permanent (faked here)", len(persist_calls) >= 1)
     check("Keep: GUI reconnected (fresh connection, old one closed)",
           app.om is not om_before_keep and om_before_keep.display._ptr is None and W().om is app.om)
     return False

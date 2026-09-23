@@ -62,7 +62,7 @@ rules file describes mode, position, scale and transform, plus only these
 on/off rules: plain `disabled` for external monitors that were off, and the
 guarded disable for a laptop panel (see "Durable Keep").
 
-## Durable Keep: detailed design (2026-09-23; approved, U1/U2 done, live tests pending)
+## Durable Keep: detailed design (2026-09-23; implemented, U1/U2 + L1-L9 passed; L10/L11 pending)
 
 ### Files (all ours, in `~/.config/hypr/displayctl/`)
 
@@ -168,8 +168,9 @@ Rules:
    temp file + rename). First time: `.prev` is a placeholder with no rules.
 4. Write the new `monitors.lua`/`.json`: write `*.tmp` in the same
    directory, fsync, `os.replace` (atomic: Hyprland never sees half a file).
-5. Reload: rely on auto-reload if L2 shows it notices changes to our
-   dofile'd file; otherwise `hyprctl reload` (L3). Exactly one reload.
+5. Reload: `hyprctl reload`, exactly once (L2: Hyprland does NOT
+   auto-reload when our dofile'd file is created or changed; L3: `hyprctl
+   reload` works with the Lua config).
 6. Verify, twice 2 s apart, both views (fresh protocol read + hyprctl)
    against the kept layout, and `hyprctl configerrors` empty.
 7. If verification fails: restore `.prev` (atomic), reload, verify the
@@ -225,26 +226,42 @@ pass; every Lua scenario runs under Lua 5.5, 5.4 and LuaJIT):
 
 After you add the dofile line (expect eDP-1 to switch on when you save;
 each live step below checks both views and hyprctl configerrors):
+**L1-L9 DONE 2026-09-23** (kanshi off, nothing else connected; every step
+checked in both views + `hyprctl configerrors`; results inline):
 - **L1** Probe file (no rules, only writes what `hl.get_monitors` returns at
   load time to a log): does our file get loaded, and does `get_monitors`
-  work at config-load time?
+  work at config-load time? -> Loaded on reload (one load per reload);
+  `get_monitors` works at config-load time during a reload (listed DP-3
+  with its description). Startup is still L10.
 - **L2** Rewrite the probe: does auto-reload notice a change to our
-  dofile'd file (probe log timestamp changes)?
+  dofile'd file (probe log timestamp changes)? -> **No**, neither creating
+  nor modifying it. So writing the file does not trigger a reload by
+  itself; displayctl reloads explicitly.
 - **L3** Only if L2 says no: does `hyprctl reload` work with the Lua config?
+  -> Yes. It re-applies the catch-all (eDP-1 came on, as expected) and does
+  NOT re-run the `hl.on("hyprland.start")` autostarts (kanshi, waybar,
+  swaync, ... counts unchanged).
 - **L4** Precedence and mode strings: file with a DP-3 rule at 144 Hz ->
   reload -> both views show 144 (named rule beats the catch-all) ->
-  rewrite to 200 -> reload -> 200.
+  rewrite to 200 -> reload -> 200. -> Both passed; `@143.999` accepted.
 - **L5** Guard, positive: eDP-1 on; file = DP-3 rule + guarded eDP-1 off
   kept with DP-3's description -> reload -> eDP-1 off in both views.
+  -> Passed; exactly one load, no handler reload (the panel's own
+  monitor.removed was ignored), stable after 8 s.
 - **L6** Guard, fail-safe: same but KEPT_WITH = a description that isn't
-  connected -> reload -> eDP-1 stays/comes ON.
+  connected -> reload -> eDP-1 stays/comes ON. -> Passed (fail-safe), one
+  load, no handler reload.
 - **L7** Full flow through the GUI (live driver): eDP-1 on + left -> Apply
   -> Keep -> file written, reloaded, verified = kept layout; files and
-  `.prev` as expected.
+  `.prev` as expected. -> Passed 11/11 (tests/gui_live_durable.py),
+  including: a plain `hyprctl reload` afterwards keeps the layout.
 - **L8** `displayctl.py undo` -> previous layout restored, verified; Revert
-  in its 15 s dialog -> swapped back, verified.
+  in its 15 s dialog -> swapped back, verified. -> Passed (undo
+  --auto-revert-after 3: baseline during the hold, left layout after the
+  swap back; then undo --auto-keep).
 - **L9** Restore baseline (DP-3 200 at 0,0, eDP-1 off) with a final Keep,
-  so the file on disk matches it.
+  so the file on disk matches it. -> Done via undo + keep; a plain reload
+  keeps it.
 - **L11** (required before anything relies on the file for docking) With
   eDP-1 kept off by the file and kanshi stopped, the user physically
   unplugs the Samsung: the laptop panel must come on within a few seconds
