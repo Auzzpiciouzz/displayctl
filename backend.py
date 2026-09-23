@@ -420,6 +420,67 @@ def verify_state(desired, settle=1.0):
     return problems, missing
 
 
+def hyprland_disagreements(heads):
+    """On Hyprland, compare the protocol's view of each head with hyprctl's.
+
+    Returns None when not running under Hyprland, otherwise a list of
+    human-readable disagreements ([] = both views agree).
+
+    Why: after a boot, Hyprland once reported eDP-1 as enabled through
+    wlr-output-management while hyprctl (and the screen) said disabled.
+    Since every configuration restates all enabled heads, applying from
+    that wrong view switched eDP-1 on. We can't know which view is right,
+    so the caller refuses to apply instead of guessing.
+    """
+    if "HYPRLAND_INSTANCE_SIGNATURE" not in os.environ:
+        return None
+    import subprocess  # only needed on Hyprland
+    try:
+        out = subprocess.run(
+            ["hyprctl", "monitors", "all", "-j"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout
+        hypr = {m["name"]: m for m in json.loads(out)}
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return [f"could not read hyprctl monitors: {e}"]
+
+    problems = []
+    for head in heads:
+        m = hypr.get(head.name)
+        if m is None:
+            problems.append(f"{head.name}: in the protocol but not in hyprctl")
+            continue
+        hypr_enabled = not m["disabled"]
+        if head.enabled != hypr_enabled:
+            problems.append(
+                f"{head.name}: protocol says enabled={head.enabled}, "
+                f"hyprctl says enabled={hypr_enabled}"
+            )
+            continue
+        if not head.enabled:
+            continue  # hyprctl keeps showing a stale mode for disabled outputs
+        mode = head.current_mode
+        if mode is None:
+            problems.append(f"{head.name}: protocol reports no current mode")
+            continue
+        if (mode.width, mode.height) != (m["width"], m["height"]) or abs(
+            mode.refresh_mhz / 1000 - m["refreshRate"]
+        ) > 1:
+            problems.append(
+                f"{head.name}: protocol mode {mode.width}x{mode.height}@"
+                f"{mode.refresh_mhz / 1000:.2f}, hyprctl {m['width']}x{m['height']}@"
+                f"{m['refreshRate']:.2f}"
+            )
+        if tuple(head.position) != (m["x"], m["y"]):
+            problems.append(
+                f"{head.name}: protocol position {head.position[0]},{head.position[1]}, "
+                f"hyprctl {m['x']},{m['y']}"
+            )
+    for name in hypr.keys() - {h.name for h in heads}:
+        problems.append(f"{name}: in hyprctl but not in the protocol")
+    return problems
+
+
 def desired_from_snapshot(snapshot):
     """Turn snapshot data into the {name: state} dict run_configuration wants."""
     return {h["name"]: h for h in snapshot["heads"]}

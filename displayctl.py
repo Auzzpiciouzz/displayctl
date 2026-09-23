@@ -30,7 +30,8 @@ from pathlib import Path
 
 from backend import (
     CACHE_DIR, LAST_GOOD, TRANSFORM_BY_NAME, TRANSFORMS,
-    OutputManager, WaylandError, desired_from_snapshot, save_json, verify_state,
+    OutputManager, WaylandError, desired_from_snapshot, hyprland_disagreements,
+    save_json, verify_state,
 )
 
 CONFIRM_SECONDS = 15
@@ -277,6 +278,16 @@ def cmd_set(args):
         print(f"{target}:")
         print(f"  now: {describe(before)}")
         print(f"  new: {describe(after)}")
+
+        # 0. Guard (Hyprland only): the protocol and hyprctl must agree on
+        #    the current state. We restate every head in full, so a wrong
+        #    view would be applied for real. Never guess which is right.
+        problems = hyprland_disagreements(om.heads)
+        if problems:
+            print("REFUSING TO APPLY: the protocol and hyprctl disagree:", file=sys.stderr)
+            for p in problems:
+                print(f"  {p}", file=sys.stderr)
+            die("fix the mismatch first (see CLAUDE.md findings); nothing was changed")
 
         # 1. Snapshot, before anything else touches the displays.
         snapshot = om.snapshot()
