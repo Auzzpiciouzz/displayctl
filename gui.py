@@ -302,15 +302,22 @@ class LayoutCanvas(Gtk.DrawingArea):
 
             self._draw_label(cr, head, state, rect, fg, accent, dim)
 
-    def _draw_label(self, cr, head, state, rect, fg, accent, dim):
-        """Name (large, bold), mode or "Disabled", and "Not applied" if pending."""
+    @staticmethod
+    def label_lines(state):
+        """(detail, hint) under a monitor's name. hint is None or a call to action."""
         if state["enabled"] and state["mode"]:
             m = state["mode"]
             detail = f"{m['width']}×{m['height']} @ {format_hz(m['refresh_mhz'], 2)} Hz"
             if abs(state["scale"] - 1) > 1e-6:
                 detail += f" · {state['scale'] * 100:g}%"
-        else:
-            detail = "Disabled"
+            return detail, None
+        # Say that the dashed rectangle can be clicked, and what for.
+        return "Disabled", "Click to set up"
+
+    def _draw_label(self, cr, head, state, rect, fg, accent, dim):
+        """Name (large, bold), mode or "Disabled" (+ "Click to set up"), and
+        "Not applied" if pending."""
+        detail, hint = self.label_lines(state)
         name = GLib.markup_escape_text(head.name)
         pending = head.name in self.window.pending
         accent_hex = "#{:02x}{:02x}{:02x}".format(
@@ -321,6 +328,9 @@ class LayoutCanvas(Gtk.DrawingArea):
         for name_size, detail_size in ((180, 125), (140, 110), (100, 90)):
             markup = (f'<span size="{name_size}%" weight="bold">{name}</span>\n'
                       f'<span size="{detail_size}%">{GLib.markup_escape_text(detail)}</span>')
+            if hint:
+                markup += (f'\n<span size="{detail_size - 15}%" style="italic">'
+                           f'{GLib.markup_escape_text(hint)}</span>')
             if pending:
                 markup += (f'\n<span size="{detail_size}%" weight="bold" '
                            f'foreground="{accent_hex}">Not applied</span>')
@@ -372,7 +382,7 @@ class LayoutCanvas(Gtk.DrawingArea):
         if self._drag.get("single"):
             if not self._drag["hinted"] and max(abs(dx), abs(dy)) >= self.DRAG_START_PX:
                 self._drag["hinted"] = True
-                self.window.toast("Turn on another display to arrange them.")
+                self.window.arrange_hint()
             return
         factor = self._drag["view"][0]
         sx, sy = self._drag["start"]
@@ -955,6 +965,38 @@ class MainWindow(Adw.ApplicationWindow):
 
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
+
+    def arrange_hint(self):
+        """Tried to drag with only one monitor on: say exactly what to do.
+
+        Names the disabled monitor(s). With exactly one, the toast also has
+        a "Select <name>" button that selects it, so its "Use this display"
+        switch is right there in the panel.
+        """
+        states = self.effective()
+        off = [h.name for h in self.om.heads if not states[h.name]["enabled"]]
+        if not off:
+            text = "Connect another display to arrange displays."
+        elif len(off) == 1:
+            text = (f"Turn on {off[0]} to arrange displays: select it and switch on "
+                    "“Use this display”.")
+        else:
+            text = (f"Turn on another display ({', '.join(off)}) to arrange displays: "
+                    "select it and switch on “Use this display”.")
+        self.last_hint = text  # for the test harness
+        toast = Adw.Toast(title=GLib.markup_escape_text(text), timeout=8)
+        # HIGH: show it now, not queued behind whatever toast is showing
+        # (libadwaita shows one toast at a time).
+        toast.set_priority(Adw.ToastPriority.HIGH)
+        if len(off) == 1:
+            toast.set_button_label(f"Select {off[0]}")
+            toast.connect("button-clicked", lambda *_: self.select(off[0]))
+        self.toasts.add_toast(toast)
+
+    def select(self, name):
+        """Select a monitor as if it had been clicked on the canvas."""
+        self.canvas.selected = name
+        self.on_select(name)
 
     def alert(self, heading, body):
         dialog = Adw.AlertDialog(heading=heading, body=body)

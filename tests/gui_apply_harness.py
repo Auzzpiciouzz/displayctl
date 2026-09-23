@@ -300,18 +300,40 @@ def s_drag_disabled_denied():
 
 def s_single_monitor_hint():
     # only DP-3 is on: dragging it must do nothing but show the hint (once)
-    redraw(); n = len(toasts); before = box("eDP-1")
+    redraw(); before = box("eDP-1")
+    added = []
+    real_add = W().toasts.add_toast
+    W().toasts.add_toast = lambda t: (added.append(t), real_add(t))
     c = W().canvas; g = FakeGesture(); x, y = center("DP-3")
     c._on_drag_begin(g, x, y)
     c._on_drag_update(g, 2, 1)                # tiny: still a click, no hint
-    hint_after_tiny = len(toasts) > n
+    hint_after_tiny = len(added) > 0
     for d in (40, 120, 300): c._on_drag_update(g, d, 0)
     c._on_drag_end(g, 300, 0)
+    W().toasts.add_toast = real_add
     check("single monitor: no hint for a tiny move (a click)", not hint_after_tiny)
-    check("single monitor: drag refused with one hint",
-          toasts[n:] == ["Turn on another display to arrange them."] and W().pending == {}, toasts[n:])
+    check("single monitor: drag refused with exactly one hint", len(added) == 1 and W().pending == {})
+    check("hint names the disabled monitor and says what to do",
+          W().last_hint == "Turn on eDP-1 to arrange displays: select it and switch on “Use this display”.",
+          W().last_hint)
+    check("hint toast has a 'Select eDP-1' button", added and added[0].get_button_label() == "Select eDP-1")
+    GLib.timeout_add(300, lambda: (shot("t9-hint-toast"), False)[1])
+    GLib.timeout_add(600, lambda: press_hint_button(added[0]))
     redraw()
     check("single monitor: nothing moved", box("eDP-1") == before)
+    return False
+def press_hint_button(toast):
+    toast.emit("button-clicked"); settle()
+    check("toast button selects eDP-1 and shows its switch",
+          W().canvas.selected == "eDP-1" and W().details.get_visible_child_name() == "details"
+          and not W().details.use_row.get_active())
+    return False
+
+def s_label_lines():
+    edp = W().effective()["eDP-1"]; dp3 = W().effective()["DP-3"]
+    check("dashed rectangle says 'Disabled' + 'Click to set up'",
+          gui.LayoutCanvas.label_lines(edp) == ("Disabled", "Click to set up"))
+    check("enabled monitor label has no hint", gui.LayoutCanvas.label_lines(dp3)[1] is None)
     return False
 
 def s_disabled_row_fixed():
@@ -419,7 +441,7 @@ steps = [(1500, s_start), (1200, s_guard_all_off), (1200, s_enable_edp_then_off_
          (600, s_apply_cancelled),
          (800, s_second_check_catches_late_change), (6500, s_after_second_check),
          (800, s_revert_fails_handover),
-         (5000, s_drag_disabled_denied), (600, s_single_monitor_hint), (1000, s_disabled_row_fixed),
+         (5000, s_drag_disabled_denied), (600, s_single_monitor_hint), (1500, s_label_lines), (400, s_disabled_row_fixed),
          (600, s_drag_left), (900, s_drag_preview_shot),
          (1500, s_drag_anchor), (1200, s_reflow_on_scale),
          (900, s_apply_after_drag), (1800, s_keep_after_drag),

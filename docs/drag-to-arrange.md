@@ -35,8 +35,11 @@ it. Disabled monitors can't be dragged (they have no position).
 including the row of disabled monitors, stays still on screen. The
 normalisation happens on release (the view then recentres).
 
-**One enabled monitor**: nothing to arrange; dragging is refused with the
-hint "Turn on another display to arrange them."
+**One enabled monitor**: nothing to arrange; dragging is refused and a
+high-priority toast names what to do, e.g. "Turn on eDP-1 to arrange
+displays: select it and switch on “Use this display”." with a
+"Select eDP-1" button. Disabled monitors' dashed rectangles say
+"Disabled / Click to set up".
 
 ## Snapping (layout.snap_position)
 
