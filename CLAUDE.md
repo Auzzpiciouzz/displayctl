@@ -78,12 +78,18 @@ GTK); gui.py handles edits from GLib.idle_add.
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and blocks other tools),
   and don't use nwg-displays alongside (it's another output-management tool).
-1. Phase 3 step 4 manual tests (drag-to-arrange; list in the latest drag
-   commit message; design in docs/drag-to-arrange.md). Positions are always
-   non-negative (layout normalised to 0,0 on release).
-2. Phase 4: rule-based dock switching in Lua on Hyprland (design in
-   docs/hyprland-persistence.md), which also replaces kanshi.
-3. Upstream: docs/upstream-issue.md is a DRAFT; review before filing.
+1. Manual drag-to-arrange tests 2–8 (list in commit 1d67d92's message; test 1
+   done). In test 5, after turning eDP-1 off again, check that DP-3 moves
+   back to 0,0 (in-memory check says it should: the layout is normalised
+   so it starts at 0,0).
+2. Make "Keep" durable: write the kept layout to our own monitors.lua
+   (design in docs/hyprland-persistence.md: protocol = preview,
+   monitors.lua = keep; our file is ~/.config/hypr/displayctl/monitors.lua,
+   NOT ~/.config/hypr/monitors.lua, which nwg-displays wrote; never disable
+   eDP-1 in it; revert = restore previous file + reload + verify).
+3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
+   Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
+- Later: docs/upstream-issue.md is a DRAFT; review before filing.
 
 ## Rules
 - HARD RULE on Hyprland: connect -> apply -> verify -> disconnect. Never stay
