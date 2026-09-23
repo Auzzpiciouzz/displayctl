@@ -30,6 +30,11 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   DECISION: displayctl skips test() when HYPRLAND_INSTANCE_SIGNATURE is set
   (local checks + hyprctl cross-check instead); other compositors keep it.
   Worth reporting upstream (see docs/hyprland-persistence.md).
+- The applying client is sent the head state from BEFORE its own commit and
+  nothing after (its view is one change behind); watchers also got stale
+  enable/disable state. Fresh reads are right. The GUI syncs its view from a
+  fresh read during the hold and reconnects after every transaction;
+  displayctl verifies its own apply (twice) before asking Keep.
 - Hyprland sends `done` only to the client that applied a change; clients that
   only watch get the head updates without `done`. gui.py refreshes after any
   batch that arrives without `done`. A watching connection does NOT block
@@ -44,7 +49,9 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   LOGIN (`hl.exec_cmd("kanshi")`) — it runs after every boot until killed.
   eDP-1's "disabled" state came from kanshi via the protocol, not a Hyprland
   rule, so any rule re-evaluation turns eDP-1 back on (catch-all = enabled).
-  kanshi uses the same protocol as displayctl; don't run both.
+  kanshi uses the same protocol as displayctl; don't run both. It stays
+  connected after applying, so while it runs every other tool's changes are
+  silently ignored (see the hard rule under Rules).
 - After a boot the protocol once said eDP-1 enabled while hyprctl said
   disabled; applying from that view turned eDP-1 on. Not reproduced by
   killing kanshi mid-session; suspected startup race. displayctl.py now
@@ -67,19 +74,24 @@ GTK gotcha: never rebuild a widget from inside its own change signal (hung
 GTK); gui.py handles edits from GLib.idle_add.
 
 ## Next steps (as of 2026-09-23)
-- Dev sessions: `pkill kanshi` first (it's autostarted and fights displayctl),
+- Dev sessions: `pkill kanshi` first (it's autostarted and blocks other tools),
   and don't use nwg-displays alongside (it's another output-management tool).
-1. Decide the fix for the GUI's stale view (Hyprland sends the applying
-   client the pre-commit state; see docs, "Root cause of test 9") and for
-   "an idle applying client blocks everyone" (e.g. GUI closes/reopens its
-   connection after Keep?). Report-first: not implemented yet.
+1. Decide: the idle GUI (a pure watcher) was still one change behind for
+   eDP-1 on/off. Proposed: on every update wakeup, re-read on a fresh
+   connection (debounced) instead of trusting pushed head state.
 2. Phase 3 step 4: drag-to-arrange (position editing) on the canvas.
 3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
-   docs/hyprland-persistence.md; open points listed there).
-4. Optional, later: startup-race test; report Hyprland deviations upstream
-   (test() side effect, no 'done' for watchers, serials ignored).
+   docs/hyprland-persistence.md), which also replaces kanshi.
+4. Upstream: docs/upstream-issue.md is a DRAFT; review before filing.
 
 ## Rules
+- HARD RULE on Hyprland: connect -> apply -> verify -> disconnect. Never stay
+  connected after applying. While the client that applied the last change is
+  connected, Hyprland ignores every other client's changes ("succeeded", no
+  effect) and sends that client stale state. displayctl closes right after
+  apply; the GUI reconnects after every Keep/Revert. kanshi VIOLATES this (it
+  stays connected after applying), so it blocks all other tools while it
+  runs; that likely explains the first night's "revert didn't take" failures.
 - Never edit ~/.config/hypr/hyprland.lua; the app owns only its own monitors.lua
 - Any apply must be revertible; test before apply. Display changes go through
   displayctl.py (snapshot + watchdog), never ad-hoc scripts

@@ -39,6 +39,10 @@ def fake_run_configuration(desired, action):
     applied.append((action, json.loads(json.dumps(desired))))
     return apply_results.pop(0) if apply_results else "succeeded"
 
+# Class-level: the GUI opens NEW connections after every transaction, and
+# each of them must be fake too.
+backend.OutputManager.run_configuration = lambda self, desired, action: fake_run_configuration(desired, action)
+
 verify_results = []     # scripted verify_state results (problem lists)
 def fake_verify(desired, settle=1.0):
     return (verify_results.pop(0) if verify_results else [], [])
@@ -81,7 +85,7 @@ def dialog(): return W().applier.dialog
 
 # ---- scenarios -------------------------------------------------------------
 def s_start():
-    app.om.run_configuration = fake_run_configuration   # BEFORE anything can apply
+    check("apply is faked at class level", backend.OutputManager.run_configuration.__name__ == "<lambda>")
     live = {h.name: h.to_state() for h in app.om.heads}
     check("starts with no pending edits, Apply/Reset disabled",
           not W().pending and not W().apply_button.get_sensitive() and not W().reset_button.get_sensitive())
@@ -152,6 +156,7 @@ def s_apply_keep():
     return False
 
 def s_keep_dialog_shown():
+    global om_before_keep; om_before_keep = app.om
     check("keep dialog shown", dialog() is not None)
     body = dialog().get_body()
     check("dialog has countdown + Hyprland note", "Reverting to the previous settings in" in body and "Hyprland reloads" in body, body)
@@ -160,9 +165,12 @@ def s_keep_dialog_shown():
     wd = watchdogs[-1]
     check("Keep: watchdog stands down", wd.cmds == ["applied", "keep"], wd.cmds)
     check("Keep: pending cleared, not busy", W().pending == {} and not W().applier.busy)
+    check("Keep: GUI reconnected (fresh connection, old one closed)",
+          app.om is not om_before_keep and om_before_keep.display._ptr is None and W().om is app.om)
     return False
 
 def s_apply_timeout():
+    global om_before_timeout; om_before_timeout = app.om
     select("DP-3"); pick("refresh", "143.999 Hz")
     verify_results[:] = [[], [], []]   # apply verify, revert verify, revert re-verify
     W().apply_button.emit("clicked")
@@ -174,6 +182,7 @@ def s_after_timeout():
           reverted[0] == "apply" and reverted[1]["DP-3"]["mode"]["refresh_mhz"] == 200000, reverted[1].get("DP-3"))
     check("timeout: watchdog told applied then keep (after verified revert)", wd.cmds == ["applied", "keep"], wd.cmds)
     check("timeout: not busy, pending cleared", not W().applier.busy and W().pending == {})
+    check("verified revert: GUI reconnected", app.om is not om_before_timeout and om_before_timeout.display._ptr is None)
     return False
 
 def s_apply_esc():
@@ -221,7 +230,6 @@ def s_after_second_check():
     wd = watchdogs[-1]
     check("second check catches a late re-enable -> handover to watchdog",
           wd.cmds == ["applied", "revert"] and old_om2.display._ptr is None, wd.cmds)
-    app.om.run_configuration = fake_run_configuration
     return False
 
 def s_revert_fails_handover():
@@ -239,7 +247,6 @@ def after_handover(old_om):
           wd.cmds == ["applied", "revert"] and old_om.display._ptr is None, wd.cmds)
     check("handover: reconnected with a new connection", app.om is not old_om and W().om is app.om)
     check("handover: not busy afterwards", not W().applier.busy)
-    app.om.run_configuration = fake_run_configuration  # keep the new connection fake too
     return False
 
 def s_end():

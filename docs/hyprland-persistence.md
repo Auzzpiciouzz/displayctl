@@ -165,9 +165,12 @@ must be answered `cancelled`: Hyprland 0.56.2 doesn't check serials.
 
 ## GUI apply strategy (decided from the tests above)
 
-**On Hyprland: keep the single persistent connection** for watching, applying
-and reverting. A fresh connection per apply buys nothing, because serials
-aren't checked. Instead the safety comes from:
+**On Hyprland: one connection per transaction.** The same connection watches,
+applies and (if needed) reverts within one Apply; after Keep or a verified
+revert the GUI closes it and opens a fresh one (superseded the earlier
+"keep one connection forever": see the HARD RULE section below). Serials
+aren't checked, so a fresh connection per apply isn't needed for that.
+The safety comes from:
 1. the live-refreshed state (gui.py refreshes on `done` and on done-less
    update batches), so what the user edits starts from the current layout;
 2. the protocol-vs-hyprctl cross-check right before every apply (as
@@ -234,6 +237,38 @@ eDP-1 on. Not fixed yet (design decision pending).
   client connected Hyprland ignored its revert (REVERT FAILED, recovered by
   hand). Fixed: it now identifies the process by PID + start time
   (/proc/PID/stat field 22), recorded when the watchdog starts.
+
+## HARD RULE: connect -> apply -> verify -> disconnect
+
+On Hyprland 0.56.2 a client must never stay connected after applying:
+- while it's connected, every other client's configuration is answered
+  "succeeded" and ignored (confirmed, see above);
+- it is sent the pre-commit state, so its own view is wrong.
+
+How the code follows it:
+- displayctl.py closes right after apply, then verifies on fresh reads.
+- gui.py (stays open by design) syncs its view from a fresh read during the
+  Keep dialog, and closes + reopens its connection after every finished
+  transaction (Keep, verified revert, cancelled). Verified live on
+  2026-09-23: GUI applied DP-3 144 Hz + Keep, stayed open; then
+  `displayctl set eDP-1 --enable` really turned eDP-1 on (both views) and
+  displayctl's own verification confirmed it.
+- The watchdog uses a fresh connection per attempt and exits.
+
+**kanshi violates the rule**: it keeps its connection after applying a
+profile. So while kanshi runs, every other tool's change is silently
+ignored. That most likely explains the first night's failures ("revert
+didn't take" while kanshi, autostarted by hyprland.lua, was running).
+
+### Open: watchers see stale enable/disable state
+
+In the same live test, the idle GUI was a pure watcher on a fresh connection
+(it had not applied anything on it), yet its pushed updates were one change
+behind for eDP-1: "off" when eDP-1 came on, "on" when it went off. (An
+earlier DP-3 mode change was reported correctly, so it may be specific to
+enabling/disabling.) Proposed fix: on every update wakeup, re-read on a fresh
+connection (debounced ~300 ms) and sync, instead of trusting pushed state.
+Not implemented yet.
 
 ## Phase 4 design: rule-based dock switching on Hyprland
 

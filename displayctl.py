@@ -37,6 +37,7 @@ import safety
 from safety import WATCHDOG_LOG, LockBusy, start_watchdog, tell
 
 CONFIRM_SECONDS = 15
+VERIFY_SECONDS = 5  # time allowed for verify_applied (~3 s) before the countdown
 HERE = Path(__file__).resolve().parent
 
 # What each configuration result means, in plain words.
@@ -344,7 +345,9 @@ def cmd_set(args):
         # 3. Start the watchdog BEFORE applying, so it exists if we crash mid-apply.
         # The watchdog's deadline must outlast our own wait, however long it is.
         wait_seconds = args.auto_revert_after or args.self_revert_test or CONFIRM_SECONDS
-        watchdog = start_watchdog(lock, max(CONFIRM_SECONDS, wait_seconds))
+        # + VERIFY_SECONDS: verifying the apply (step 5b) happens before the
+        # countdown starts, so the watchdog must allow for it too.
+        watchdog = start_watchdog(lock, max(CONFIRM_SECONDS, wait_seconds) + VERIFY_SECONDS)
 
         # 4. Apply.
         try:
@@ -380,6 +383,23 @@ def cmd_set(args):
         # "succeeded" but not carried out. Tested: 144 -> 180 -> revert
         # worked with this close and failed without it.
         om.close()
+
+        # 5b. Did it actually happen? "succeeded" only means accepted: on
+        # Hyprland a change is silently ignored while another client that
+        # applied the last change is still connected. Same check as for
+        # reverts (fresh read, then again 2 s later). Never report success
+        # for a change that didn't happen.
+        problems = verify_applied(desired)
+        if problems:
+            print("The compositor said 'succeeded', but the change did NOT take effect:")
+            for p in problems:
+                print(f"  {p}")
+            print("(Another client that applied a change may still be connected, e.g. "
+                  "kanshi or the GUI; see CLAUDE.md.)")
+            tell(watchdog, "revert")
+            wait_for_revert(watchdog)
+            sys.exit(1)
+        print("Verified: the displays match the requested settings.")
         if args.auto_keep:
             # Testing aid: confirm without a terminal, like pressing "y".
             print("--auto-keep: keeping")
@@ -409,6 +429,20 @@ def cmd_set(args):
             wait_for_revert(watchdog)
     finally:
         om.close()
+
+
+def verify_applied(desired):
+    """Fresh-read check that `desired` is live, twice (now and 2 s later).
+
+    Returns a list of problems ([] = the change really took effect).
+    """
+    try:
+        problems, _ = verify_state(desired)          # waits 1 s to settle
+        if not problems:
+            problems, _ = verify_state(desired, settle=2)
+    except WaylandError as e:
+        problems = [f"could not re-read outputs: {e}"]
+    return problems
 
 
 def self_revert_test(om, watchdog, snapshot, args):

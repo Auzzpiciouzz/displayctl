@@ -214,6 +214,29 @@ class OutputManager:
             proxy._display = self.display
             self.display._children.add(proxy)
 
+    def sync_from(self, states):
+        """Overwrite our view of the heads with states read elsewhere.
+
+        Why: on Hyprland 0.56.2 the client that applies a change is sent the
+        head state from BEFORE its own commit, and nothing after it, so its
+        view is one change behind (see docs/hyprland-persistence.md). A
+        fresh connection sees the truth; the GUI copies that in here.
+        states: {name: state dict} as from read_states().
+        """
+        for head in self.heads:
+            s = states.get(head.name)
+            if s is None:
+                continue
+            head.enabled = s["enabled"]
+            head.position = tuple(s["position"])
+            head.transform = s["transform"]
+            head.scale = s["scale"]
+            m = s["mode"]
+            head.current_mode = (
+                head.find_mode(m["width"], m["height"], m["refresh_mhz"])
+                if (s["enabled"] and m) else None
+            )
+
     def head(self, name):
         for head in self.heads:
             if head.name == name:
@@ -406,6 +429,12 @@ def state_mismatches(want, have):
     if abs(want["scale"] - have["scale"]) > 1e-6:
         problems.append(f"scale {have['scale']} (want {want['scale']})")
     return problems
+
+
+def read_states():
+    """{name: state} for every head, read on a NEW connection (read-only)."""
+    with OutputManager() as om:
+        return {h.name: h.to_state() for h in om.heads}
 
 
 def verify_state(desired, settle=1.0):

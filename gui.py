@@ -536,6 +536,7 @@ class Applier:
         if result == "cancelled":
             safety.tell(self.watchdog, "keep")  # nothing was applied
             self._finish()
+            self.window.app.reconnect()  # we still sent a configuration
             self.window.alert("Apply was cancelled",
                               "The displays changed while applying (monitor plugged or "
                               "unplugged?). Nothing was changed. Check the layout and try again.")
@@ -554,7 +555,10 @@ class Applier:
     def _verify_then_ask(self):
         problems, _ = backend.verify_state(self.desired, settle=0)
         log.debug("verify after apply: %s", problems or "ok")
-        # Log (and show) the live state our own connection reports during the hold.
+        # Hyprland sends the applying client (us) the state from BEFORE our
+        # commit, so our own view is now one change behind. Replace it with
+        # a fresh read, then log and show the real live state.
+        self.om.sync_from(backend.read_states())
         self.window.refresh()
         self._ask(problems)
         return GLib.SOURCE_REMOVE
@@ -613,8 +617,7 @@ class Applier:
         log.debug("decision: %s", "keep" if keep else "revert")
         if keep:
             safety.tell(self.watchdog, "keep")
-            self._finish()
-            self.window.clear_pending()
+            self._end_transaction()
             self.window.toast("Display settings kept")
         else:
             self._revert()
@@ -641,8 +644,7 @@ class Applier:
             return GLib.SOURCE_REMOVE
         if not problems:
             safety.tell(self.watchdog, "keep")  # already restored: nothing left to do
-            self._finish()
-            self.window.clear_pending()
+            self._end_transaction()
             self.window.toast("Reverted to the previous settings")
         else:
             # Our revert didn't take. On Hyprland another client's revert is
@@ -661,6 +663,19 @@ class Applier:
             self.window.alert("Revert failed",
                               f"Neither the GUI nor the watchdog could restore the previous "
                               f"settings. See {safety.WATCHDOG_LOG}.\nSnapshot: {backend.LAST_GOOD}")
+
+    def _end_transaction(self):
+        """Keep or verified revert: done. Drop "last applier" status.
+
+        Hard rule on Hyprland: connect -> apply -> verify -> disconnect.
+        While the client that applied the last change stays connected,
+        Hyprland ignores other clients' changes (kanshi, displayctl, a dock
+        daemon), and it keeps sending us stale state. A fresh connection
+        fixes both, and gives us a correct initial state.
+        """
+        self._finish()
+        self.window.pending = {}
+        self.window.app.reconnect()
 
     def _finish(self):
         self.busy = False
@@ -824,14 +839,32 @@ class DisplayctlApp(Adw.Application):
     def _watch(self, om):
         self.source = WaylandSource(om, self.window.show_error, self.window.refresh)
 
+    def _disconnect(self):
+        self.source.stop()
+        self.om.close()
+
+    def _connect(self):
+        try:
+            self.om = OutputManager()
+        except WaylandError as e:
+            self.window.show_error(f"Couldn't reconnect to the compositor: {e}")
+            return
+        self._watch(self.om)
+        self.window.set_om(self.om)
+
+    def reconnect(self):
+        """Close our output-management connection and open a fresh one."""
+        log.debug("reconnecting (ends 'last applier' status, fresh state)")
+        self._disconnect()
+        self._connect()
+
     def handover_to_watchdog(self, watchdog, done):
         """Disconnect, let the watchdog revert, reconnect, then done(exit_code).
 
         Needed when our own revert didn't take: on Hyprland the watchdog's
         revert only works once the applying client (us) has disconnected.
         """
-        self.source.stop()
-        self.om.close()
+        self._disconnect()
         safety.tell(watchdog, "revert")
         waited = [0]
 
@@ -840,9 +873,7 @@ class DisplayctlApp(Adw.Application):
             waited[0] += 1
             if code is None and waited[0] < 120:  # up to 60 s
                 return GLib.SOURCE_CONTINUE
-            self.om = OutputManager()
-            self._watch(self.om)
-            self.window.set_om(self.om)
+            self._connect()
             done(code if code is not None else 1)
             return GLib.SOURCE_REMOVE
 
