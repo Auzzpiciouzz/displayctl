@@ -82,6 +82,9 @@ def use(on):
 def labels(key):
     m = W().details.combos[key].get_model(); return [m.get_string(i) for i in range(m.get_n_items())]
 def dialog(): return W().applier.dialog
+def respond(r):
+    """Like clicking a dialog button: emit the response AND close the dialog."""
+    d = dialog(); d.emit("response", r); d.force_close()
 
 # ---- scenarios -------------------------------------------------------------
 def s_start():
@@ -161,7 +164,7 @@ def s_keep_dialog_shown():
     body = dialog().get_body()
     check("dialog has countdown + Hyprland note", "Reverting to the previous settings in" in body and "Hyprland reloads" in body, body)
     shot("t5-keep-dialog")
-    dialog().emit("response", "keep"); dialog().force_close() if dialog() else None
+    respond("keep")
     wd = watchdogs[-1]
     check("Keep: watchdog stands down", wd.cmds == ["applied", "keep"], wd.cmds)
     check("Keep: pending cleared, not busy", W().pending == {} and not W().applier.busy)
@@ -224,7 +227,7 @@ def s_second_check_catches_late_change():
     verify_results[:] = [[], [], ["eDP-1: enabled True (want False)"]]
     global old_om2; old_om2 = app.om
     W().apply_button.emit("clicked")
-    GLib.timeout_add(1300, lambda: (dialog().emit("response", "revert"), False)[1])
+    GLib.timeout_add(1300, lambda: (respond("revert"), False)[1])
     return False
 def s_after_second_check():
     wd = watchdogs[-1]
@@ -238,7 +241,7 @@ def s_revert_fails_handover():
     old_om = app.om
     W().apply_button.emit("clicked")
     select("DP-3"); pick("refresh", "143.999 Hz")
-    GLib.timeout_add(1300, lambda: (dialog().emit("response", "revert"), False)[1])
+    GLib.timeout_add(1300, lambda: (respond("revert"), False)[1])
     GLib.timeout_add(3500, lambda: after_handover(old_om))
     return False
 def after_handover(old_om):
@@ -247,6 +250,99 @@ def after_handover(old_om):
           wd.cmds == ["applied", "revert"] and old_om.display._ptr is None, wd.cmds)
     check("handover: reconnected with a new connection", app.om is not old_om and W().om is app.om)
     check("handover: not busy afterwards", not W().applier.busy)
+    return False
+
+# ---- drag-to-arrange (Phase 3 step 4) ----
+class FakeGesture:
+    def __init__(self): self.state = None
+    def set_state(self, st): self.state = st
+def center(name):
+    boxes = {n: (x, y, w, h) for n, x, y, w, h in W().canvas._hit_boxes}
+    x, y, w, h = boxes[name]; return x + w / 2, y + h / 2
+def redraw():
+    """Wait until the canvas has actually drawn again (hit boxes up to date).
+    A real user can't start a drag before the next frame; the harness can."""
+    import time
+    c = W().canvas; before = c._view; c._view = None; c.queue_draw()
+    ctx = GLib.MainContext.default(); end = time.monotonic() + 1.0
+    while c._view is None and time.monotonic() < end:
+        ctx.iteration(False)
+    if c._view is None: c._view = before
+def drag(name, to_logical, finish=True):
+    """Drag `name` so its top-left would land at to_logical (before snapping)."""
+    redraw()
+    c = W().canvas; g = FakeGesture()
+    x, y = center(name); c._on_drag_begin(g, x, y)
+    if g.state is not None: return g
+    factor = c._drag["view"][0]; sx, sy = c._drag["start"]
+    dx, dy = (to_logical[0] - sx) * factor, (to_logical[1] - sy) * factor
+    c._on_drag_update(g, dx / 2, dy / 2); c._on_drag_update(g, dx, dy)
+    if finish: c._on_drag_end(g, dx, dy)
+    return g
+def pos(name): return tuple(W().effective()[name]["position"])
+
+def s_drag_disabled_denied():
+    W().clear_pending()
+    g = drag("eDP-1", (0, 2000))
+    check("disabled monitor can't be dragged", g.state is not None and W().pending == {})
+    return False
+
+def s_drag_left():
+    select("eDP-1"); use(True)                         # pending: eDP-1 on at 2560,0
+    check("enabled eDP-1 placed right of DP-3", pos("eDP-1") == (2560, 0))
+    drag("eDP-1", (-2400, 30))                        # far left, a bit low
+    check("dragged left: snaps flush + top-aligned, DP-3 stays at 0,0",
+          pos("eDP-1") == (-1920, 0) and pos("DP-3") == (0, 0), (pos("eDP-1"), pos("DP-3")))
+    check("layout legal after drag", layout.arrangement_problems(W().effective()) == [])
+    return False
+
+def s_drag_preview_shot():
+    drag("eDP-1", (800, 1700), finish=False)          # mid-drag: below DP-3
+    p = W().canvas._drag["preview"]
+    check("mid-drag preview is legal (below DP-3)", p[1] == 1440 and layout.arrangement_problems(
+        layout._placed(W().effective(), "eDP-1", p)) == [], p)
+    W().canvas.queue_draw()
+    GLib.timeout_add(400, lambda: (shot("t6-drag-preview"), False)[1])
+    GLib.timeout_add(700, lambda: (W().canvas._on_drag_end(FakeGesture(), 0, 0), False)[1])
+    return False
+
+def s_drag_anchor():
+    W().clear_pending(); select("eDP-1"); use(True)   # eDP-1 at 2560,0 pending
+    drag("DP-3", (1920 + 2560 + 100, 0))              # drag the anchor past eDP-1
+    check("dragging the anchor keeps it at 0,0; eDP-1 moves to -1920",
+          pos("DP-3") == (0, 0) and pos("eDP-1") == (-1920, 0), (pos("DP-3"), pos("eDP-1")))
+    GLib.timeout_add(400, lambda: (shot("t7-after-anchor-drag"), False)[1])
+    return False
+
+def s_reflow_on_scale():
+    W().clear_pending(); select("eDP-1"); use(True)
+    select("DP-3"); pick("scale", "200%")             # DP-3 1280x720 logical
+    check("scale change reflows neighbour (eDP-1 -> 1280,0)", pos("eDP-1") == (1280, 0), pos("eDP-1"))
+    return False
+
+def s_apply_after_drag():
+    W().clear_pending(); select("eDP-1"); use(True); drag("eDP-1", (-2400, 0))
+    verify_results[:] = [[]]
+    n = len(applied); W().apply_button.emit("clicked")
+    sent = applied[-1][1] if len(applied) > n else {}
+    check("Apply sends the dragged positions (full config)",
+          sent.get("eDP-1", {}).get("position") == [-1920, 0] and sent.get("DP-3", {}).get("position") == [0, 0],
+          {k: v.get("position") for k, v in sent.items()})
+    return False
+def s_keep_after_drag():
+    d = dialog(); d and d.emit("response", "keep"); d and d.force_close()
+    check("drag apply kept, not busy", not W().applier.busy)
+    return False
+
+def s_illegal_layout_refused():
+    W().clear_pending(); select("eDP-1"); use(True)
+    st = dict(W().pending["eDP-1"]); st["position"] = [3000, 0]    # a gap, injected directly
+    W().pending["eDP-1"] = st; W().refresh()
+    n = len(applied); W().apply_button.emit("clicked")
+    check("gap in layout: Apply refused, nothing sent", len(applied) == n and not W().applier.busy)
+    d = W().get_visible_dialog()
+    check("refusal explains the arrangement", d is not None and "touch" in d.get_body(), d and d.get_body())
+    GLib.timeout_add(300, lambda: (shot("t8-refused-gap"), d and d.force_close(), W().clear_pending(), False)[-1])
     return False
 
 def s_end():
@@ -261,7 +357,11 @@ steps = [(1500, s_start), (1200, s_guard_all_off), (1200, s_enable_edp_then_off_
          (600, s_apply_failed), (3800, s_after_failed),
          (600, s_apply_cancelled),
          (800, s_second_check_catches_late_change), (6500, s_after_second_check),
-         (800, s_revert_fails_handover), (5000, s_end)]
+         (800, s_revert_fails_handover),
+         (5000, s_drag_disabled_denied), (800, s_drag_left), (900, s_drag_preview_shot),
+         (1500, s_drag_anchor), (1200, s_reflow_on_scale),
+         (900, s_apply_after_drag), (1800, s_keep_after_drag),
+         (900, s_illegal_layout_refused), (1500, s_end)]
 
 def run(i=0):
     delay, fn = steps[i]

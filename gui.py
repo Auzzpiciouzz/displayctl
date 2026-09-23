@@ -154,25 +154,44 @@ class WaylandSource:
 
 
 class LayoutCanvas(Gtk.DrawingArea):
-    """Draws the EFFECTIVE layout (live state + pending edits); click to select.
+    """Draws the EFFECTIVE layout (live state + pending edits); click to
+    select, drag an enabled monitor to move it.
 
     Enabled monitors sit at their position. Disabled ones have no position
     in the layout, so they're drawn dimmed with a dashed border in a row to
     the right, at their preferred mode's size. Monitors with pending edits
     get a "Not applied" line.
+
+    Dragging (docs/drag-to-arrange.md): the logical<->screen mapping is
+    frozen at drag start (otherwise the view would rescale under the
+    pointer); every motion asks layout.snap_position for the nearest legal
+    spot and draws the monitor there; on release the window turns it into a
+    pending edit.
     """
+
+    # Snap to edge/centre alignment within this many SCREEN pixels.
+    SNAP_SCREEN_PX = 10
 
     def __init__(self, window):
         super().__init__(hexpand=True, vexpand=True)
         self.window = window  # gives us heads, effective states, pending
         self.selected = None  # name of the selected head, or None
         self._hit_boxes = []  # (name, x, y, w, h) in widget pixels, from the last draw
+        self._enabled_names = set()  # which hit boxes may be dragged
+        self._view = None  # (factor, offset_x, offset_y, left, top) of the last draw
+        self._drag = None  # while dragging: name, start position, frozen view, preview
 
         self.set_draw_func(self._draw)
 
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_click)
         self.add_controller(click)
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._on_drag_begin)
+        drag.connect("drag-update", self._on_drag_update)
+        drag.connect("drag-end", self._on_drag_end)
+        self.add_controller(drag)
 
         # Redraw when the user switches light/dark or accent colour.
         style = Adw.StyleManager.get_default()
@@ -182,6 +201,9 @@ class LayoutCanvas(Gtk.DrawingArea):
     def _layout_boxes(self):
         """(head, state, x, y, w, h) for every head, in compositor units."""
         states = self.window.effective()
+        if self._drag and self._drag.get("preview"):
+            # Show the dragged monitor at its snapped preview position.
+            states[self._drag["name"]]["position"] = list(self._drag["preview"])
         boxes = []
         for head in self.window.om.heads:
             s = states[head.name]
@@ -212,18 +234,24 @@ class LayoutCanvas(Gtk.DrawingArea):
         if not boxes:
             return
 
-        # 1. Bounding box of everything we draw, in compositor coordinates.
-        left = min(b[2] for b in boxes)
-        top = min(b[3] for b in boxes)
-        right = max(b[2] + b[4] for b in boxes)
-        bottom = max(b[3] + b[5] for b in boxes)
+        if self._drag:
+            # Frozen mapping while dragging.
+            factor, offset_x, offset_y, left, top = self._drag["view"]
+        else:
+            # 1. Bounding box of everything we draw, in compositor coordinates.
+            left = min(b[2] for b in boxes)
+            top = min(b[3] for b in boxes)
+            right = max(b[2] + b[4] for b in boxes)
+            bottom = max(b[3] + b[5] for b in boxes)
 
-        # 2. One scale factor for both axes keeps the real proportions;
-        #    then centre the layout in the widget, with padding all round.
-        factor = min((width - 2 * PADDING) / (right - left),
-                     (height - 2 * PADDING) / (bottom - top))
-        offset_x = (width - (right - left) * factor) / 2
-        offset_y = (height - (bottom - top) * factor) / 2
+            # 2. One scale factor for both axes keeps the real proportions;
+            #    then centre the layout in the widget, with padding all round.
+            factor = min((width - 2 * PADDING) / (right - left),
+                         (height - 2 * PADDING) / (bottom - top))
+            offset_x = (width - (right - left) * factor) / 2
+            offset_y = (height - (bottom - top) * factor) / 2
+        self._view = (factor, offset_x, offset_y, left, top)
+        self._enabled_names = {b[0].name for b in boxes if b[1]["enabled"] and b[1]["mode"]}
 
         fg = self.get_color()  # the theme's text colour (light or dark)
         accent = Adw.StyleManager.get_default().get_accent_color_rgba()
@@ -289,6 +317,45 @@ class LayoutCanvas(Gtk.DrawingArea):
         cr.set_source_rgba(fg.red, fg.green, fg.blue, dim)
         cr.move_to(rect[0] + (rect[2] - text_w) / 2, rect[1] + (rect[3] - text_h) / 2)
         PangoCairo.show_layout(cr, layout_)
+
+    # --- dragging ---
+
+    def _hit(self, x, y):
+        for name, bx, by, bw, bh in self._hit_boxes:
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return name
+        return None
+
+    def _on_drag_begin(self, gesture, x, y):
+        name = self._hit(x, y)
+        if name not in self._enabled_names or self._view is None or self.window.applier.busy:
+            gesture.set_state(Gtk.EventSequenceState.DENIED)  # nothing to drag
+            return
+        start = self.window.effective()[name]["position"]
+        self._drag = {"name": name, "start": tuple(start), "view": self._view, "preview": None}
+        log.debug("drag begin %s at %s", name, start)
+
+    def _on_drag_update(self, gesture, dx, dy):
+        if not self._drag:
+            return
+        factor = self._drag["view"][0]
+        sx, sy = self._drag["start"]
+        raw = (sx + dx / factor, sy + dy / factor)  # screen px -> logical px
+        self._drag["preview"] = layout.snap_position(
+            self.window.effective(), self._drag["name"], raw,
+            threshold=self.SNAP_SCREEN_PX / factor)
+        self.queue_draw()
+
+    def _on_drag_end(self, gesture, dx, dy):
+        if not self._drag:
+            return
+        self._on_drag_update(gesture, dx, dy)
+        drag, self._drag = self._drag, None
+        log.debug("drag end %s at %s", drag["name"], drag["preview"])
+        if drag["preview"] and tuple(drag["preview"]) != drag["start"]:
+            self.window.on_move(drag["name"], drag["preview"])
+        else:
+            self.queue_draw()
 
     def _on_click(self, gesture, n_press, x, y):
         clicked = None
@@ -820,9 +887,33 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast(str(e))
             self.refresh()  # put the control back to what it was
             return
-        self.pending = layout.set_pending(self.pending, head, state)
+        new_states = dict(states)
+        new_states[name] = state
+        if what in ("resolution", "scale", "rotation"):
+            # The monitor's logical size changed: keep neighbours attached.
+            new_states = layout.reflow_after_resize(states, new_states, name)
+        self._set_states(layout.normalize(new_states, self.anchor()))
         log.debug("edit %s %s=%s -> pending %s", name, what, value, sorted(self.pending))
         self.refresh()
+
+    def on_move(self, name, pos):
+        """A monitor was dragged to `pos` (already snapped to a legal spot)."""
+        if self.om.head(name) is None or self.applier.busy:
+            return
+        self._set_states(layout.moved(self.effective(), name, pos, self.anchor()))
+        log.debug("move %s to %s -> pending %s", name, pos, sorted(self.pending))
+        self.refresh()
+
+    def anchor(self):
+        """The monitor that stays at 0,0 (decided from the LIVE layout)."""
+        return layout.anchor_name({h.name: h.to_state() for h in self.om.heads})
+
+    def _set_states(self, states):
+        """Make `states` the effective layout: pending = what differs from live."""
+        pending = self.pending
+        for head in self.om.heads:
+            pending = layout.set_pending(pending, head, states[head.name])
+        self.pending = pending
 
     # --- messages ---
 

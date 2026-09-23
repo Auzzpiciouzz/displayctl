@@ -207,4 +207,164 @@ def validate(states):
             problems.append(f"{name} is on but has no resolution.")
         if s["enabled"] and s["scale"] <= 0:
             problems.append(f"{name} has an invalid scale.")
+    if not problems:
+        arrangement = arrangement_problems(states)
+        if arrangement:
+            problems += arrangement + ["Drag the displays so they touch without overlapping."]
     return problems
+
+
+# --- arranging (Phase 3 step 4; design in docs/drag-to-arrange.md) -----------------
+
+
+def rect(state):
+    """(x, y, w, h) of an enabled state in logical pixels."""
+    w, h = logical_size(state)
+    return (state["position"][0], state["position"][1], w, h)
+
+
+def enabled_rects(states):
+    return {n: rect(s) for n, s in states.items() if s["enabled"] and s["mode"]}
+
+
+def overlaps(a, b):
+    """True if rectangles a and b share any area (touching edges don't count)."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
+
+
+def touches(a, b):
+    """True if a and b share an edge segment longer than 0 (not just a corner)."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    shared_y = min(ay + ah, by + bh) - max(ay, by)
+    shared_x = min(ax + aw, bx + bw) - max(ax, bx)
+    side_by_side = (ax + aw == bx or bx + bw == ax) and shared_y > 0
+    stacked = (ay + ah == by or by + bh == ay) and shared_x > 0
+    return side_by_side or stacked
+
+
+def arrangement_problems(states):
+    """Overlaps and gaps in the enabled layout. [] means legal."""
+    rects = enabled_rects(states)
+    names = sorted(rects)
+    problems = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if overlaps(rects[a], rects[b]):
+                problems.append(f"{a} and {b} overlap.")
+    if len(names) > 1:
+        # Connected? Walk across shared edges from the first monitor.
+        seen, todo = {names[0]}, [names[0]]
+        while todo:
+            cur = todo.pop()
+            for other in names:
+                if other not in seen and touches(rects[cur], rects[other]):
+                    seen.add(other)
+                    todo.append(other)
+        loose = [n for n in names if n not in seen]
+        if loose:
+            problems.append("Not all displays touch each other: "
+                            + ", ".join(loose) + " would float apart.")
+    return problems
+
+
+def anchor_name(states):
+    """The monitor that stays at 0,0: the one there now, else the top-left-most."""
+    rects = enabled_rects(states)
+    if not rects:
+        return None
+    for name, (x, y, _w, _h) in rects.items():
+        if (x, y) == (0, 0):
+            return name
+    return min(rects, key=lambda n: (rects[n][0], rects[n][1], n))
+
+
+def normalize(states, anchor):
+    """Shift every enabled monitor so `anchor` is at 0,0 (new dicts).
+
+    If the anchor isn't enabled (any more), the top-left-most monitor is used.
+    """
+    rects = enabled_rects(states)
+    if anchor not in rects:
+        anchor = anchor_name(states)
+        if anchor is None:
+            return copy.deepcopy(states)
+    dx, dy = rects[anchor][0], rects[anchor][1]
+    new = copy.deepcopy(states)
+    for name in rects:
+        x, y = new[name]["position"]
+        new[name]["position"] = [x - dx, y - dy]
+    return new
+
+
+def _placed(states, name, pos):
+    new = copy.deepcopy(states)
+    new[name]["position"] = [int(pos[0]), int(pos[1])]
+    return new
+
+
+def _align(value, targets, threshold):
+    """Snap `value` to the nearest target within `threshold`, if any."""
+    best = min(targets, key=lambda t: abs(value - t))
+    return best if abs(value - best) <= threshold else value
+
+
+def snap_position(states, name, raw, threshold=64):
+    """The legal position for `name` closest to `raw` (logical px).
+
+    Tries every side of every other enabled monitor (flush against it,
+    sharing at least 1 px of edge), aligns edges/centres within
+    `threshold`, keeps only layouts without overlaps or gaps, and returns
+    the candidate nearest to `raw`. See docs/drag-to-arrange.md.
+    """
+    rx, ry = int(round(raw[0])), int(round(raw[1]))
+    others = {n: r for n, r in enabled_rects(states).items() if n != name}
+    if not others:
+        return (rx, ry)  # alone: anywhere (normalize puts it at 0,0)
+    w, h = logical_size(states[name])
+
+    def clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    candidates = []
+    for ox, oy, ow, oh in others.values():
+        y = clamp(ry, oy - h + 1, oy + oh - 1)
+        y = _align(y, [oy, oy + oh - h, oy + (oh - h) // 2], threshold)
+        candidates += [(ox + ow, y), (ox - w, y)]        # right of / left of
+        x = clamp(rx, ox - w + 1, ox + ow - 1)
+        x = _align(x, [ox, ox + ow - w, ox + (ow - w) // 2], threshold)
+        candidates += [(x, oy + oh), (x, oy - h)]        # below / above
+    legal = [c for c in candidates if not arrangement_problems(_placed(states, name, c))]
+    if not legal:
+        return tuple(states[name]["position"])
+    return min(legal, key=lambda c: ((c[0] - rx) ** 2 + (c[1] - ry) ** 2, c))
+
+
+def moved(states, name, pos, anchor):
+    """All states after moving `name` to `pos`, then re-anchoring."""
+    return normalize(_placed(states, name, pos), anchor)
+
+
+def reflow_after_resize(before, after, name):
+    """Keep neighbours attached when `name` changes size (res/scale/rotation).
+
+    before/after: all states, differing only in `name`'s size. Monitors that
+    touched its old right edge move by the width change; those that touched
+    its old bottom edge move by the height change. Returns new states.
+    """
+    if not (before[name]["enabled"] and after[name]["enabled"]):
+        return copy.deepcopy(after)
+    x, y, w, h = rect(before[name])
+    _, _, w2, h2 = rect(after[name])
+    new = copy.deepcopy(after)
+    for other, (ox, oy, _ow, _oh) in enabled_rects(before).items():
+        if other == name:
+            continue
+        pos = new[other]["position"]
+        if ox == x + w:
+            pos[0] += w2 - w
+        if oy == y + h:
+            pos[1] += h2 - h
+    return new

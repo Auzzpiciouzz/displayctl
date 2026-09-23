@@ -68,7 +68,7 @@ Backend protocol: wlr-output-management-unstable-v1
 (XML at /usr/share/wlr-protocols/unstable/). Venv: .venv (system site packages).
 Files: backend.py (Wayland), displayctl.py (CLI), watchdog.py (revert
 process), safety.py (lock + watchdog helpers, shared by CLI and GUI),
-layout.py (GUI edit logic, no GTK/Wayland; tests in tests/, run
+layout.py (GUI edit + arrange logic, no GTK/Wayland; tests in tests/, run
 `.venv/bin/python -m unittest discover -s tests`), gui.py (GTK4 GUI; Wayland
 fd in the GLib main loop, one persistent connection that watches, applies
 and reverts; `--debug` logs fd wakeups, refreshes, redraws, apply steps).
@@ -78,11 +78,11 @@ GTK); gui.py handles edits from GLib.idle_add.
 ## Next steps (as of 2026-09-23)
 - Dev sessions: `pkill kanshi` first (it's autostarted and blocks other tools),
   and don't use nwg-displays alongside (it's another output-management tool).
-1. Phase 3 step 4 manual tests (drag-to-arrange; list in the step-4 commit).
-2. Phase 3 step 4: drag-to-arrange (position editing) on the canvas.
-3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
+1. Phase 3 step 4 manual tests (drag-to-arrange; list in the step-4 commit;
+   design in docs/drag-to-arrange.md).
+2. Phase 4: rule-based dock switching in Lua on Hyprland (design in
    docs/hyprland-persistence.md), which also replaces kanshi.
-4. Upstream: docs/upstream-issue.md is a DRAFT; review before filing.
+3. Upstream: docs/upstream-issue.md is a DRAFT; review before filing.
 
 ## Rules
 - HARD RULE on Hyprland: connect -> apply -> verify -> disconnect. Never stay
