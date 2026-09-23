@@ -147,6 +147,10 @@ class OutputManager:
         self.manager_version = 0  # the version we bound (pywayland doesn't track it)
         self.heads = []
         self.serial = None  # from the latest 'done'; needed to create configurations
+        # Functions to call after every 'done' event, i.e. whenever the
+        # compositor has finished describing a (new) consistent state.
+        # The GUI adds one to redraw; the CLI doesn't use it.
+        self.listeners = []
 
         registry = self.display.get_registry()
         registry.dispatcher["global"] = self._on_global
@@ -223,6 +227,8 @@ class OutputManager:
 
     def _on_done(self, manager, serial):
         self.serial = serial
+        for listener in list(self.listeners):
+            listener()
 
     def _on_head(self, manager, proxy):
         self._adopt(proxy)
@@ -420,6 +426,11 @@ def verify_state(desired, settle=1.0):
     return problems, missing
 
 
+def on_hyprland():
+    """True when running under Hyprland (it sets this variable for clients)."""
+    return "HYPRLAND_INSTANCE_SIGNATURE" in os.environ
+
+
 def hyprland_disagreements(heads):
     """On Hyprland, compare the protocol's view of each head with hyprctl's.
 
@@ -432,7 +443,7 @@ def hyprland_disagreements(heads):
     that wrong view switched eDP-1 on. We can't know which view is right,
     so the caller refuses to apply instead of guessing.
     """
-    if "HYPRLAND_INSTANCE_SIGNATURE" not in os.environ:
+    if not on_hyprland():
         return None
     import subprocess  # only needed on Hyprland
     try:

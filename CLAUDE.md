@@ -26,9 +26,10 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   after apply — keep it that way. The GUI must revert through its OWN
   connection (tested: works); the watchdog is only the crash fallback.
 - `test()` is NOT side-effect-free on Hyprland: it makes Hyprland re-apply its
-  config rules to all outputs (a protocol-disabled eDP-1 came back on). So
-  `--dry-run` can change the screen, and each `set` briefly passes through
-  the rule state between test() and apply().
+  config rules to all outputs (a protocol-disabled eDP-1 came back on).
+  DECISION: displayctl skips test() when HYPRLAND_INSTANCE_SIGNATURE is set
+  (local checks + hyprctl cross-check instead); other compositors keep it.
+  Worth reporting upstream (see docs/hyprland-persistence.md).
 - "succeeded" doesn't prove anything happened: always re-read and verify.
 - kanshi: config at ~/.config/kanshi/config (profiles external / extend /
   laptop / undocked; "external" disables eDP-1). hyprland.lua STARTS IT AT
@@ -48,17 +49,21 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
 Python 3, PyGObject (GTK4 + libadwaita), pywayland.
 Backend protocol: wlr-output-management-unstable-v1
 (XML at /usr/share/wlr-protocols/unstable/). Venv: .venv (system site packages).
+Files: backend.py (Wayland), displayctl.py (CLI), watchdog.py (revert
+process), gui.py (GTK4 GUI; Wayland fd in the GLib main loop, one persistent
+connection, redraws on every 'done').
 
 ## Next steps (as of 2026-09-23)
-1. Decide whether displayctl skips `test()` on Hyprland (it re-applies config
-   rules; see docs/hyprland-persistence.md). Until then, avoid `--dry-run`
-   when eDP-1 is disabled: it turns it back on.
-2. Decide kanshi's future: it's autostarted by hyprland.lua and fights
-   displayctl. (You edit hyprland.lua; displayctl never does.)
-3. Optional: test the startup-race hypothesis for the protocol/hyprctl
-   mismatch (needs a Hyprland restart with kanshi autostart on).
-4. Start Phase 3: the GTK4 / libadwaita GUI. Revert design is settled: the
-   GUI reverts through its own connection; watchdog = crash fallback only.
+- Dev sessions: `pkill kanshi` first (it's autostarted and fights displayctl).
+1. Phase 3 step 2: drag-to-arrange on the canvas (still no applying), then
+   applying from the GUI with the 15 s keep/revert. Revert through the GUI's
+   OWN connection; watchdog only as crash fallback.
+2. Check the GUI's live refresh: keep it open and change a mode with
+   displayctl.py in kitty; the canvas should update on the 'done' event
+   (only tested in-memory so far).
+3. Phase 4: rule-based dock switching in Lua on Hyprland (design in
+   docs/hyprland-persistence.md; open points listed there).
+4. Optional, later: startup-race test; report the test() side effect upstream.
 
 ## Rules
 - Never edit ~/.config/hypr/hyprland.lua; the app owns only its own monitors.lua

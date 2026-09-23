@@ -8,6 +8,7 @@
 How `set` stays safe:
   1. snapshot the current state -> ~/.cache/displayctl/last-good.json
   2. test()   the new configuration (the compositor validates it; nothing changes)
+              -- skipped on Hyprland, where test() has side effects
   3. start watchdog.py, a separate process that will restore the snapshot
      unless we tell it "keep"
   4. apply()  the new configuration
@@ -31,7 +32,7 @@ from pathlib import Path
 from backend import (
     CACHE_DIR, LAST_GOOD, TRANSFORM_BY_NAME, TRANSFORMS,
     OutputManager, WaylandError, desired_from_snapshot, hyprland_disagreements,
-    save_json, verify_state,
+    on_hyprland, save_json, verify_state,
 )
 
 CONFIRM_SECONDS = 15
@@ -295,10 +296,20 @@ def cmd_set(args):
         print(f"Saved current state to {LAST_GOOD}")
 
         # 2. Test: the compositor checks the configuration but changes nothing.
-        result = om.run_configuration(desired, "test")
-        if result != "succeeded":
-            die(f"test {result}. {RESULT_MESSAGES[result]} Nothing was changed.")
-        print("Test passed.")
+        #    EXCEPT on Hyprland (0.56.2): there test() makes it re-apply its
+        #    config rules to all outputs, which can switch a disabled
+        #    output back on. So on Hyprland we rely on our own checks
+        #    (build_desired: mode exists, scale > 0, not everything off)
+        #    plus the hyprctl cross-check above. See
+        #    docs/hyprland-persistence.md, "test() is not side-effect-free".
+        if on_hyprland():
+            print("test() skipped on Hyprland: it re-applies Hyprland's config "
+                  "rules as a side effect. Local checks and hyprctl cross-check passed.")
+        else:
+            result = om.run_configuration(desired, "test")
+            if result != "succeeded":
+                die(f"test {result}. {RESULT_MESSAGES[result]} Nothing was changed.")
+            print("Test passed.")
         if args.dry_run:
             print("--dry-run: stopping before apply.")
             return
