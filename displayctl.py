@@ -30,7 +30,7 @@ from pathlib import Path
 
 from backend import (
     CACHE_DIR, LAST_GOOD, TRANSFORM_BY_NAME, TRANSFORMS,
-    OutputManager, WaylandError, save_json,
+    OutputManager, WaylandError, desired_from_snapshot, save_json, verify_state,
 )
 
 CONFIRM_SECONDS = 15
@@ -279,7 +279,8 @@ def cmd_set(args):
         print(f"  new: {describe(after)}")
 
         # 1. Snapshot, before anything else touches the displays.
-        save_json(LAST_GOOD, om.snapshot())
+        snapshot = om.snapshot()
+        save_json(LAST_GOOD, snapshot)
         print(f"Saved current state to {LAST_GOOD}")
 
         # 2. Test: the compositor checks the configuration but changes nothing.
@@ -293,7 +294,7 @@ def cmd_set(args):
 
         # 3. Start the watchdog BEFORE applying, so it exists if we crash mid-apply.
         # The watchdog's deadline must outlast our own wait, however long it is.
-        wait_seconds = args.auto_revert_after or CONFIRM_SECONDS
+        wait_seconds = args.auto_revert_after or args.self_revert_test or CONFIRM_SECONDS
         watchdog = start_watchdog(lock, max(CONFIRM_SECONDS, wait_seconds))
 
         # 4. Apply.
@@ -319,6 +320,11 @@ def cmd_set(args):
 
         # 5. It's live. Ask the user, with the watchdog as a backup.
         tell(watchdog, "applied")
+        if args.self_revert_test is not None:
+            # Experiment: this must run BEFORE the early close below, because
+            # it's about reverting while the applying connection is still open.
+            self_revert_test(om, watchdog, snapshot, args)
+            return
         # Close our Wayland connection now. REQUIRED, not tidiness: on
         # Hyprland, while the client that applied a change stays connected,
         # a revert applied by another client (the watchdog) is answered
@@ -356,6 +362,53 @@ def cmd_set(args):
         om.close()
 
 
+def self_revert_test(om, watchdog, snapshot, args):
+    """Experiment for the GUI design: can a client that stays connected
+    revert its own change? (docs/hyprland-persistence.md, "GUI + watchdog
+    conflict".)
+
+    The change is live and the watchdog is armed. We keep `om` (the
+    connection that applied the change) open, wait, then revert either:
+      via="same":   through `om` itself
+      via="helper": through a second connection in this process, while
+                    `om` stays open
+    and verify on a fresh connection. If the revert didn't take, we close
+    `om` and let the watchdog revert, as the backup.
+    """
+    via = args.self_revert_via
+    print(f"--self-revert-test: holding {args.self_revert_test}s, "
+          f"then reverting via the {via} connection (applying connection stays open)")
+    time.sleep(args.self_revert_test)
+
+    desired = desired_from_snapshot(snapshot)
+    if via == "same":
+        # Catch up on events first, so om has the latest serial; a stale
+        # serial would get the configuration cancelled.
+        om.roundtrip()
+        result = om.run_configuration(desired, "apply")
+    else:
+        with OutputManager() as helper:
+            result = helper.run_configuration(desired, "apply")
+    print(f"self-revert apply ({via} connection): {result}")
+
+    problems, _ = verify_state(desired)
+    if not problems:
+        print(f"RESULT: self-revert via the {via} connection WORKED (verified).")
+        print("Restored by: displayctl (self-revert). Telling the watchdog to stand down.")
+        tell(watchdog, "keep")  # display is already restored; nothing left to undo
+        watchdog.wait(timeout=10)
+        return
+
+    for p in problems:
+        print(f"  verify mismatch: {p}")
+    print(f"RESULT: self-revert via the {via} connection did NOT take.")
+    print("Closing the applying connection and handing over to the watchdog...")
+    om.close()
+    tell(watchdog, "revert")
+    wait_for_revert(watchdog)  # exits with an error if the watchdog fails too
+    print("Restored by: watchdog (backup), after the applying connection closed.")
+
+
 # --- Command line ----------------------------------------------------------------
 
 
@@ -380,6 +433,11 @@ def main():
     p.add_argument("--auto-revert-after", type=float, metavar="SECONDS",
                    help=argparse.SUPPRESS)
     p.add_argument("--auto-keep", action="store_true", help=argparse.SUPPRESS)
+    # Hidden: experiment for the GUI revert design (see self_revert_test).
+    p.add_argument("--self-revert-test", type=float, metavar="SECONDS",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--self-revert-via", choices=["same", "helper"], default="same",
+                   help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     try:

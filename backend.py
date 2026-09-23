@@ -18,6 +18,7 @@ Protocol rules we have to respect (from the XML):
 
 import json
 import os
+import time
 from pathlib import Path
 
 from pywayland.client import Display
@@ -190,6 +191,21 @@ class OutputManager:
         if self.display.roundtrip() == -1:
             raise WaylandError("Wayland connection failed (protocol error?)")
 
+    def _adopt(self, proxy):
+        """Make a proxy the compositor just created belong to OUR connection.
+
+        pywayland bug: for objects created by an event (every head and mode),
+        it picks "the first open connection it knows" instead of the
+        connection the event arrived on. With two connections open in one
+        process, the second one's heads/modes get filed under the first.
+        Closing the second frees them; closing the first then destroys them
+        again -> segfault. Re-filing each new proxy here prevents that.
+        """
+        if proxy._display is not self.display:
+            proxy._display._children.discard(proxy)
+            proxy._display = self.display
+            self.display._children.add(proxy)
+
     def head(self, name):
         for head in self.heads:
             if head.name == name:
@@ -209,6 +225,7 @@ class OutputManager:
         self.serial = serial
 
     def _on_head(self, manager, proxy):
+        self._adopt(proxy)
         head = Head(proxy)
         self.heads.append(head)
 
@@ -248,6 +265,7 @@ class OutputManager:
         d["finished"] = on_finished
 
     def _on_mode(self, head, proxy):
+        self._adopt(proxy)
         mode = Mode(proxy)
         head.modes.append(mode)
 
@@ -377,6 +395,29 @@ def state_mismatches(want, have):
     if abs(want["scale"] - have["scale"]) > 1e-6:
         problems.append(f"scale {have['scale']} (want {want['scale']})")
     return problems
+
+
+def verify_state(desired, settle=1.0):
+    """Re-read the outputs on a NEW connection and compare with `desired`.
+
+    Returns (problems, missing): problems is a list of differences ([] means
+    the outputs match), missing lists heads in `desired` that aren't
+    connected any more (skipped, not counted as problems).
+
+    "succeeded" only means the compositor accepted a request; this checks
+    what it actually did. `settle` gives a mode switch a moment to finish.
+    """
+    time.sleep(settle)
+    problems, missing = [], []
+    with OutputManager() as om:
+        for name, want in desired.items():
+            head = om.head(name)
+            if head is None:
+                missing.append(name)
+                continue
+            for p in state_mismatches(want, head.to_state()):
+                problems.append(f"{name}: {p}")
+    return problems, missing
 
 
 def desired_from_snapshot(snapshot):

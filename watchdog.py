@@ -25,7 +25,7 @@ import select
 import sys
 import time
 
-from backend import OutputManager, WaylandError, desired_from_snapshot, state_mismatches
+from backend import OutputManager, WaylandError, desired_from_snapshot, verify_state
 
 # If displayctl.py never even reports "applied" (it hung while applying),
 # give up waiting after this long and revert.
@@ -91,25 +91,11 @@ def apply_snapshot(desired):
 
 
 def verify(desired):
-    """Re-read the outputs on a new connection and compare with the snapshot.
-
-    Returns a list of problems ([] means the revert really took effect).
-    "succeeded" only means the compositor accepted the request; this
-    checks what it actually did.
-    """
-    # Give the compositor a moment: a mode switch can finish slightly after
-    # 'succeeded' is sent.
-    time.sleep(1.0)
-    with OutputManager() as om:
-        problems = []
-        for name, want in desired.items():
-            head = om.head(name)
-            if head is None:
-                log(f"  verify: {name} is no longer connected, skipping")
-                continue
-            for p in state_mismatches(want, head.to_state()):
-                problems.append(f"{name}: {p}")
-        return problems
+    """Check the revert really took effect (see backend.verify_state)."""
+    problems, missing = verify_state(desired)
+    for name in missing:
+        log(f"  verify: {name} is no longer connected, skipping")
+    return problems
 
 
 def revert(snapshot):
