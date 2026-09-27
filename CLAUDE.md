@@ -94,6 +94,10 @@ GTK); gui.py handles edits from GLib.idle_add.
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.
+- Later: test i3 in tests/test_durable.py disables the "gone" memory by
+  text-replacing `and not is_gone` in the generated Lua (it asserts the
+  text exists, but it's fragile). Replace it with a proper test-only flag
+  in GUARD_TEMPLATE.
 
 ## Rules
 - HARD RULE on Hyprland: connect -> apply -> verify -> disconnect. Never stay

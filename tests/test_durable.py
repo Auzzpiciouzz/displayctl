@@ -151,7 +151,9 @@ class U1Undock(unittest.TestCase):
         for lua in INTERPRETERS:
             for slow in (0, 1, 3, 8, 20):
                 with self.subTest(lua=lua, slow=slow):
-                    r = undock(slow, lua=lua)
+                    # 40 s: past the gone memory's expiry (31 s), whose re-check
+                    # must leave the panel on (the Samsung really is gone).
+                    r = undock(slow, lua=lua, run_for=40)
                     self.assertTrue(r.panel_on)
                     self.assertEqual(r.black, 0.0)          # on at the event itself
                     self.assertGreaterEqual(r.direct, 1)
@@ -170,7 +172,9 @@ class U1Undock(unittest.TestCase):
     def test_i3_old_behaviour_would_have_failed(self):
         # Sanity check of the model: with the "gone" memory disabled (as in the
         # old file), a stale list makes the reload turn the panel off again.
-        text = gen(docked_edp_off()).replace("and not gone[desc]", "")
+        text = gen(docked_edp_off())
+        self.assertIn("and not is_gone", text)      # else the replace below is a silent no-op
+        text = text.replace("and not is_gone", "")
         r = durable.run_mock(text, [DP3], event={"name": "monitor.removed", "monitor": DP3,
                                                  "after": [], "at": 1, "slow": 3},
                              lua=INTERPRETERS[0], direct_works=False)
@@ -228,6 +232,54 @@ class U1Undock(unittest.TestCase):
                     "name": "monitor.removed", "monitor": "destroyed", "after": [], "at": 1, "slow": 3})
                 self.assertTrue(r.panel_on)
                 self.assertEqual(r.black, 0.0)
+
+    def test_o2_unidentifiable_removal_survives_stale_list_and_failed_direct_enable(self):
+        # Worst case: the event gives no description (or no readable object at
+        # all), the direct enable doesn't work, and get_monitors stays stale.
+        # The rescue reload must still leave the panel on: the handler
+        # remembers the port, or "*" if even the name is unreadable. Before
+        # this fix the panel stayed black for slow >= ~4 s.
+        for lua in INTERPRETERS:
+            for monitor in ("destroyed", {"name": "DP-3"}):
+                for slow in (3, 8, 20):
+                    with self.subTest(lua=lua, monitor=str(monitor), slow=slow):
+                        r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua,
+                                             direct_works=False, event={
+                            "name": "monitor.removed", "monitor": monitor,
+                            "after": [], "at": 1, "slow": slow})
+                        self.assertTrue(r.panel_on)
+                        self.assertLessEqual(r.black, 1.5)
+                        self.assertLessEqual(r.reloads, 2)
+
+    def test_o3_port_and_wildcard_memory_cleared_on_replug(self):
+        lua = INTERPRETERS[0]
+        for key in ("port:DP-3", "*"):
+            with self.subTest(key=key):
+                # Remembered, Samsung listed: the load keeps the panel on (safe side).
+                r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, gone={key: 5})
+                self.assertFalse(r.panel_disabled_at_load())
+                # Replug clears it: docked layout again.
+                r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, gone={key: 5}, event={
+                    "name": "monitor.added", "monitor": DP3, "after": [DP3], "at": 1})
+                self.assertFalse(r.panel_on)
+
+    def test_o4_wildcard_expiry_restores_docked_layout_without_another_event(self):
+        # An unreadable unplug set "*" 5 s before this load; then an unreadable
+        # replug arrives (it can't clear "*", it can't tell it's the Samsung).
+        # While "*" lasts the panel stays on next to the Samsung (safe side).
+        # When "*" expires (25 s after the load) a re-check must notice the
+        # Samsung and restore the docked layout (panel off) with no new event.
+        for lua in INTERPRETERS:
+            with self.subTest(lua=lua):
+                r = durable.run_mock(gen(docked_edp_off()), [], lua=lua, gone={"*": 5},
+                                     run_for=40, event={
+                    "name": "monitor.added", "monitor": "destroyed", "after": [DP3], "at": 1})
+                self.assertFalse(r.panel_disabled_at_load())         # "*" still valid at load
+                self.assertFalse(r.panel_on)                        # docked again at the end
+                self.assertTrue(r.reload_at and min(r.reload_at) >= 25.0, r.reload_at)
+                self.assertLessEqual(max(r.reload_at), 28.0)         # soon after expiry
+                self.assertEqual(r.black, 0.0)
+                self.assertEqual(r.pending, 0)
 
     def test_p_never_zero_screens_even_without_an_event(self):
         # The monitor vanishes and NO event arrives: the check after the load

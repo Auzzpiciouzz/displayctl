@@ -115,7 +115,9 @@ GUARD_TEMPLATE = r"""-- 3. Laptop panel(s) OFF only while a monitor the layout w
 --    a) monitor.removed decides from the EVENT's own data: a kept-with (or
 --       unidentifiable) monitor gone -> panel ON directly, and it's
 --       remembered as gone for GONE_TTL s, because hl.get_monitors can
---       still list it for a few seconds;
+--       still list it for a few seconds. If the event object has no
+--       description, its port is remembered instead ("port:DP-3"); if it
+--       has neither, every kept-with monitor counts as gone ("*");
 --    b) "never zero screens": after every load, event and re-check, if no
 --       real monitor is on (FALLBACK/headless don't count) -> panel ON;
 --    c) delayed re-checks after loads and events, reload if the answer
@@ -211,7 +213,8 @@ local function kept_with_present()
   local gone = read_gone()
   for _, m in ipairs(monitors()) do
     local name, desc = field(m, "name"), field(m, "description")
-    if is_real(name) and not is_panel(name) and is_kept(desc) and not gone[desc] then
+    local is_gone = gone[desc] or gone["port:" .. tostring(name)] or gone["*"]
+    if is_real(name) and not is_panel(name) and is_kept(desc) and not is_gone then
       return true
     end
   end
@@ -314,6 +317,18 @@ local function recheck(reason)
   if want ~= PANELS_OFF then request_reload(reason) end
 end
 
+-- When a "gone" entry expires nothing else may happen (e.g. an unreadable
+-- replug couldn't clear "*"), so re-check just after each entry runs out.
+-- One timer per entry; a reload destroys them, but the load schedules again.
+local function recheck_when_memory_expires()
+  for key, t in pairs(read_gone()) do
+    local left = t + GONE_TTL - os.time()
+    after(math.max(left, 0) * 1000 + 1000, function()
+      recheck("gone memory expired: " .. key)
+    end)
+  end
+end
+
 -- Handlers.
 local function on_removed(m)
   local name, desc = field(m, "name"), field(m, "description")
@@ -321,9 +336,13 @@ local function on_removed(m)
   if is_panel(name) then return end  -- our own panel switching
   if is_kept(desc) or desc == nil or name == nil then
     -- Decide from the event itself: don't wait for hl.get_monitors to catch up.
-    if desc ~= nil then
-      local gone = read_gone(); gone[desc] = os.time(); write_gone(gone)
-    end
+    -- Remember it as gone by the best key the event gives us. Without this, a
+    -- reload while hl.get_monitors is still stale would turn the panel off
+    -- again (the L11 failure). A wrong guess only keeps an extra screen on.
+    local key = desc or (name and ("port:" .. name)) or "*"
+    local gone = read_gone(); gone[key] = os.time(); write_gone(gone)
+    log("remembered as gone: " .. key)
+    recheck_when_memory_expires()
     if PANELS_OFF then enable_panels_now("kept-with monitor removed") end
   end
   after(1000, function() recheck("1 s after removal") end)
@@ -334,8 +353,10 @@ local function on_added(m)
   local name, desc = field(m, "name"), field(m, "description")
   log("event monitor.added " .. tostring(name) .. " = " .. tostring(desc))
   if is_panel(name) then return end
-  if is_kept(desc) then
-    local gone = read_gone(); gone[desc] = nil; write_gone(gone)
+  if is_kept(desc) then  -- it's back: forget every way we remembered it
+    local gone = read_gone()
+    gone[desc] = nil; gone["port:" .. tostring(name)] = nil; gone["*"] = nil
+    write_gone(gone)
   end
   after(1000, function() recheck("1 s after addition") end)
   after(3000, function() recheck("3 s after addition") end)
@@ -346,7 +367,8 @@ pcall(hl.on, "monitor.removed", on_removed)
 
 -- After every load: re-check once things have settled (also enforces the
 -- "never zero screens" invariant after a reload).
-after(2500, function() recheck("2.5 s after load") end)"""
+after(2500, function() recheck("2.5 s after load") end)
+recheck_when_memory_expires()"""
 
 
 def kept_json(states, descriptions, now=None):

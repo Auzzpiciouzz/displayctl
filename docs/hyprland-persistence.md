@@ -202,6 +202,16 @@ The fix (durable.GUARD_TEMPLATE, not yet live-tested):
   gone for 30 s in `$XDG_RUNTIME_DIR/displayctl-gone`; at load, a
   "gone" monitor counts as absent even if `get_monitors` still lists it.
   A replug (`monitor.added`) clears the memory.
+  (2026-09-27) If the event object has no readable description, the port
+  is remembered instead (`port:DP-3`), and if nothing is readable, `*`
+  (every kept-with monitor counts as gone for 30 s). Without this, an
+  unidentifiable event + an ineffective direct enable + a stale list
+  (>= ~4 s) reproduced L11 in the mock (tests o2/o3). A wrong guess only
+  keeps an extra screen on.
+  Each "gone" entry also gets a re-check 1 s after it expires (scheduled
+  when written and again at every load), so e.g. an unreadable replug that
+  can't clear `*` still ends in the docked layout ~31 s after the unplug,
+  without another event (test o4).
 - Invariant "never zero screens": after every load, event and re-check,
   if no real monitor is on (FALLBACK/HEADLESS-* ignored) -> panel ON.
 - Delayed re-checks 1 s and 3 s after events and 2.5 s after every load;
