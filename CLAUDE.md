@@ -88,9 +88,12 @@ GTK); gui.py handles edits from GLib.idle_add.
    0,0 when eDP-1 is turned off; 15 s timeout measured 15.006 s).
 2. Durable Keep: implemented; U1/U2 + L1-L9 passed. L11 (physical unplug)
    FAILED 2026-09-23 (panel stayed black); fix built + unit-tested, NOT yet
-   live-tested. Current file has NO eDP-1 rule (kanshi handles eDP-1).
-   Don't Keep a layout with eDP-1 off until L11 passes. Re-run L11 with the
-   recorder started BEFORE the unplug; L10 later (comment out kanshi).
+   live-tested. 2026-09-27: the fixed template (afb4275) was deployed with
+   `displayctl.py persist` for L11: the live file HAS the guarded eDP-1
+   disable + undock handlers (Samsung, 1440p@200 at 0,0). If L11 fails,
+   restore the old no-guard file with `displayctl.py undo`. No other
+   Keeps with eDP-1 off until L11 passes. Re-run L11 with the recorder
+   started BEFORE the unplug; L10 later (comment out kanshi).
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.
