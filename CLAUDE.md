@@ -170,6 +170,8 @@ GTK); gui.py handles edits from GLib.idle_add.
   command line (it killed the test shell twice): use exact PIDs.
 - Any apply must be revertible; test before apply. Display changes go through
   displayctl.py (snapshot + watchdog), never ad-hoc scripts
-- Generated monitors.lua must never disable eDP-1 (undocked boot = no screen);
-  enabling/disabling outputs belongs to the dock daemon
+- Generated monitors.lua must never disable eDP-1 UNCONDITIONALLY (undocked
+  boot = no screen). The only allowed disable is the guarded one: off only
+  while a kept-with monitor is connected, with the undock handlers (L11
+  passed). Rule-based dock switching beyond that belongs to the dock daemon.
 - Explain code with comments — I'm learning

@@ -519,6 +519,61 @@ class U2Files(unittest.TestCase):
         broken = "this is not lua ("
         self.assertTrue(durable.self_check(broken, data))
 
+    def test_self_check_rejects_the_l11_run2_file(self):
+        # The afb4275 reload call: under real-hardware conditions the undock
+        # check sees the logged ERROR and the black screen.
+        data = durable.kept_json(docked_edp_off(), DESC)
+        text = gen(docked_edp_off()).replace('hl.exec_cmd("hyprctl reload")',
+                                             'hl.dispatch(hl.dsp.reload_config())')
+        problems = durable.self_check(text, data)
+        self.assertTrue(any("logged an error" in p and "reload_config" in p for p in problems), problems)
+        self.assertTrue(any(p.startswith("undock") and "panel on=False" in p for p in problems), problems)
+
+    def test_self_check_rejects_a_file_whose_replug_keeps_the_panel_on(self):
+        data = durable.kept_json(docked_edp_off(), DESC)
+        line = "  if want ~= PANELS_OFF then request_reload(reason) end\n"
+        text = gen(docked_edp_off())
+        self.assertIn(line, text)
+        problems = durable.self_check(text.replace(line, ""), data)
+        self.assertIn("replug: the laptop panel stays on (docked layout not restored)", problems)
+
+    def test_keeping_the_same_layout_again_leaves_prev_alone(self):
+        a, b = gen(docked_edp_off()), gen(both_on())
+        self.assertTrue(durable.keep(a, durable.kept_json(docked_edp_off(), DESC), self.dir))
+        self.assertTrue(durable.keep(b, durable.kept_json(both_on(), DESC), self.dir))
+        # b again, generated a day later: only the timestamps differ.
+        later = datetime.datetime(2026, 9, 24, 9, 30)
+        b2 = durable.generate_lua(both_on(), DESC, now=later)
+        self.assertNotEqual(b, b2)
+        self.assertFalse(durable.keep(b2, durable.kept_json(both_on(), DESC, now=later), self.dir))
+        self.assertEqual((self.dir / "monitors.lua").read_text(), b2)
+        self.assertEqual((self.dir / "monitors.lua.prev").read_text(), a)   # Undo still goes to a
+        self.assertEqual(durable.load_json(self.dir, prev=True)["states"], docked_edp_off())
+
+    def test_failed_persist_restores_all_four_files(self):
+        # Before: current = a, .prev = placeholder. A persist of b whose
+        # verification fails must leave exactly that, NOT b in .prev (a later
+        # Undo would load the rejected file).
+        a = gen(docked_edp_off())
+        durable.keep(a, durable.kept_json(docked_edp_off(), DESC), self.dir)
+        before = {p.name: p.read_text() for p in self.dir.iterdir()}
+        with mock.patch("durable.dofile_line_present", return_value=True), \
+             mock.patch("durable.hyprland_descriptions", return_value=DESC), \
+             mock.patch("durable.reload_hyprland") as reload, \
+             mock.patch("durable.verify_durable", side_effect=[["DP-3 at 1920,0, expected 0,0"], []]):
+            problems = durable.persist(both_on(), self.dir, log=lambda *_: None)
+        self.assertEqual(reload.call_count, 2)
+        self.assertIn("previous rules restored and verified", problems)
+        self.assertEqual({p.name: p.read_text() for p in self.dir.iterdir()}, before)
+
+    def test_failed_persist_on_first_keep_removes_the_new_files(self):
+        with mock.patch("durable.dofile_line_present", return_value=True), \
+             mock.patch("durable.hyprland_descriptions", return_value=DESC), \
+             mock.patch("durable.reload_hyprland"), \
+             mock.patch("durable.verify_durable", side_effect=[["mismatch"], []]):
+            durable.persist(docked_edp_off(), self.dir, log=lambda *_: None)
+        self.assertEqual(self.files(), [])
+
     def test_self_check_refuses_without_lua(self):
         with mock.patch("durable.shutil.which", return_value=None):
             self.assertTrue(durable.self_check(gen(docked_edp_off()), durable.kept_json(docked_edp_off(), DESC)))

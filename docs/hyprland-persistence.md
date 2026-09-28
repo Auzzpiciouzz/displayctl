@@ -62,7 +62,7 @@ rules file describes mode, position, scale and transform, plus only these
 on/off rules: plain `disabled` for external monitors that were off, and the
 guarded disable for a laptop panel (see "Durable Keep").
 
-## Durable Keep: detailed design (2026-09-23; U1/U2 + L1-L9 passed; L11 FAILED, fix built, re-test pending)
+## Durable Keep: detailed design (2026-09-23; U1/U2 + L1-L9 passed; L11 passed 2026-09-28; L10 pending)
 
 ### Files (all ours, in `~/.config/hypr/displayctl/`)
 
@@ -164,11 +164,17 @@ Rules:
 
 1. Generate the Lua text and the JSON from the kept states.
 2. Self-check before writing: run the text under the local `lua` with a
-   mock `hl` in the scenarios of test U1 (docked, undocked, other monitor,
-   errors). If it fails, don't write; report (the protocol change stays,
-   just not durable).
+   mock `hl` shaped like the real 0.56.2 API, under real-hardware
+   conditions (a runtime `hl.monitor` has no effect; FALLBACK appears when
+   the last monitor goes): docked, undocked, get_monitors errors/junk,
+   unplug with a 0/3/8 s stale list (panel on within UNDOCK_BLACK_MAX s),
+   replug (docked layout back). Any "ERROR" line in the file's log fails it.
+   If it fails, don't write; report (the protocol change stays, just not
+   durable).
 3. Back up: copy the current `monitors.lua`/`.json` to `.prev` (atomic:
    temp file + rename). First time: `.prev` is a placeholder with no rules.
+   Skipped if the new files differ only in their timestamps (the same
+   layout kept again): otherwise Undo would silently do nothing.
 4. Write the new `monitors.lua`/`.json`: write `*.tmp` in the same
    directory, fsync, `os.replace` (atomic: Hyprland never sees half a file).
 5. Reload: `hyprctl reload`, exactly once (L2: Hyprland does NOT
@@ -176,15 +182,19 @@ Rules:
    reload` works with the Lua config).
 6. Verify, twice 2 s apart, both views (fresh protocol read + hyprctl)
    against the kept layout, and `hyprctl configerrors` empty.
-7. If verification fails: restore `.prev` (atomic), reload, verify the
-   previous layout, report loudly. The display must never be left in a
+7. If verification fails: put all four files back exactly as they were
+   before step 3 (not a swap, which would leave the rejected file in
+   `.prev` for a later Undo), reload, verify the previous layout, report
+   loudly. The display must never be left in a
    state nobody chose.
 
 The protocol-level safety (watchdog, 15 s dialog) has finished by then; the
 new layout was already live and confirmed, so the file only has to match it.
 
 Implementation: durable.py (generate_lua, kept_json, self_check, keep,
-undo, atomic_write). Not wired into the GUI/CLI yet.
+undo, atomic_write, snapshot_files/restore_files, persist). Wired in: the
+GUI's Keep runs `displayctl.py persist` (gui.py persist_async), the CLI's
+Keep calls make_durable() (displayctl.py).
 
 ### L11 failure (2026-09-23) and the fix
 
@@ -311,8 +321,9 @@ checked in both views + `hyprctl configerrors`; results inline):
 - **L9** Restore baseline (DP-3 200 at 0,0, eDP-1 off) with a final Keep,
   so the file on disk matches it. -> Done via undo + keep; a plain reload
   keeps it.
-- **L11** FAILED on 2026-09-23 (see "L11 failure and the fix"); re-test
-  pending. (required before anything relies on the file for docking) With
+- **L11** PASSED 2026-09-28 (run 3, c5fcfab; runs 1 and 2 failed, see
+  "L11 failure and the fix" and CLAUDE.md for run 2's root cause and run 3's
+  log). (required before anything relies on the file for docking) With
   eDP-1 kept off by the file and kanshi stopped, the user physically
   unplugs the Samsung: the laptop panel must come on within a few seconds
   (handler -> reload -> guard false). Then plug it back in: eDP-1 should
