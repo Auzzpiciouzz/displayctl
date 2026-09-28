@@ -56,6 +56,21 @@ def die(msg):
     sys.exit(1)
 
 
+# Commands that change outputs (or our rules file). kanshi can override
+# those; `list` only reads, so it gets no warning.
+CHANGING_COMMANDS = ("set", "persist", "undo")
+
+
+def warn_if_kanshi(command, stream=None):
+    """Print a warning (not an error) if kanshi runs and `command` changes things."""
+    if command not in CHANGING_COMMANDS:
+        return False
+    text = safety.kanshi_warning()
+    if text:
+        print(f"displayctl: WARNING: {text}", file=stream or sys.stderr)
+    return bool(text)
+
+
 # --- Formatting ------------------------------------------------------------------
 
 
@@ -626,6 +641,7 @@ def main():
                    help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+    warn_if_kanshi(args.command)
     try:
         if args.command == "list":
             cmd_list(args)

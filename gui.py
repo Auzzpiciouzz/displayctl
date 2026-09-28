@@ -54,6 +54,7 @@ from backend import OutputManager, WaylandError  # noqa: E402
 APP_ID = "dev.displayctl.App"
 PADDING = 56  # empty space (px) around the layout on the canvas
 CONFIRM_SECONDS = 15  # the "Keep these display settings?" countdown
+KANSHI_CHECK_SECONDS = 3  # how often the window checks whether kanshi runs
 # The watchdog must not act while the GUI is still deciding or reverting:
 # its deadline is CONFIRM_SECONDS + this (+ its own grace period).
 WATCHDOG_EXTRA_SECONDS = 15
@@ -836,8 +837,12 @@ class MainWindow(Adw.ApplicationWindow):
         body.append(self.details)
 
         self.banner = Adw.Banner()  # shown if the connection breaks
+        # Shown while kanshi runs: it can silently block or undo our changes.
+        # Plain text only (the banner title is Pango markup).
+        self.kanshi_banner = Adw.Banner(use_markup=False)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         content.append(self.banner)
+        content.append(self.kanshi_banner)
         content.append(body)
 
         view = Adw.ToolbarView(content=content)
@@ -846,6 +851,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_content(self.toasts)
 
         self.refresh()
+        # Check now and every few seconds, so the banner goes away once the
+        # user stops kanshi (and appears if it's started later).
+        self.check_kanshi()
+        GLib.timeout_add_seconds(KANSHI_CHECK_SECONDS, self.check_kanshi)
 
     # --- state ---
 
@@ -1009,6 +1018,14 @@ class MainWindow(Adw.ApplicationWindow):
     def show_error(self, message):
         self.banner.set_title(message)
         self.banner.set_revealed(True)
+
+    def check_kanshi(self):
+        """Show or hide the kanshi banner. A GLib timeout callback: keeps running."""
+        text = safety.kanshi_warning(short=True)
+        if text:
+            self.kanshi_banner.set_title(text)
+        self.kanshi_banner.set_revealed(text is not None)
+        return GLib.SOURCE_CONTINUE
 
 
 class DisplayctlApp(Adw.Application):

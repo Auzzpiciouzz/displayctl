@@ -3,6 +3,7 @@
   take_lock()       only one display change may be pending at a time
   start_watchdog()  launch watchdog.py, the separate revert process
   tell()            send it a command: "applied", "keep" or "revert"
+  kanshi_warning()  a warning text while kanshi runs (it overrides us)
 
 See watchdog.py for what the watchdog does with those commands.
 """
@@ -75,3 +76,40 @@ def tell(watchdog, command):
         watchdog.stdin.flush()
     except (BrokenPipeError, ValueError):
         pass  # it already exited (or the pipe is closed); its log says why
+
+
+def kanshi_pids(proc_dir="/proc"):
+    """PIDs of running kanshi processes, sorted.
+
+    Reads /proc/<pid>/comm (the process name, exact match) instead of running
+    pgrep: no subprocess, and no pattern that could match our own command
+    line (see the pkill -f rule in CLAUDE.md).
+    """
+    pids = []
+    for comm in Path(proc_dir).glob("[0-9]*/comm"):
+        try:
+            if comm.read_text().strip() == "kanshi":
+                pids.append(int(comm.parent.name))
+        except (OSError, ValueError):
+            pass  # the process exited while we looked, or not a PID directory
+    return sorted(pids)
+
+
+def kanshi_warning(proc_dir="/proc", short=False):
+    """A warning to show while kanshi runs, or None.
+
+    kanshi applies its own profiles on every hotplug and stays connected to
+    the output-management protocol; while it's connected, Hyprland silently
+    ignores other clients' changes (CLAUDE.md, HARD RULE). So a change we
+    make may not take effect, or kanshi may undo it later. We only warn:
+    stopping it is the user's decision.
+    """
+    pids = kanshi_pids(proc_dir)
+    if not pids:
+        return None
+    ids = " ".join(str(p) for p in pids)
+    if short:  # one line, for the GUI banner
+        return f"kanshi is running (PID {ids}): display changes may be ignored or undone. Stop it with: kill {ids}"
+    return (f"kanshi is running (PID {ids}). It applies its own profiles on every plug/unplug,"
+            f" and while it runs Hyprland may silently ignore this change or kanshi may undo it"
+            f" later. To stop it: kill {ids}")

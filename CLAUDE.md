@@ -54,6 +54,12 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   kanshi uses the same protocol as displayctl; don't run both. It stays
   connected after applying, so while it runs every other tool's changes are
   silently ignored (see the hard rule under Rules).
+  displayctl WARNS (never blocks) while kanshi runs: `set`/`persist`/`undo`
+  print a warning; the GUI shows a banner, re-checked every 3 s
+  (safety.kanshi_warning, exact match on /proc/<pid>/comm). kanshi's only
+  unique features: Super+P (display-mode.sh -> `kanshictl switch
+  external|extend|laptop`) and eDP-1 off at a docked login. Recommended
+  2026-09-28: remove it from autostart together with L10.
 - After a boot the protocol once said eDP-1 enabled while hyprctl said
   disabled; applying from that view turned eDP-1 on. Not reproduced by
   killing kanshi mid-session; suspected startup race. displayctl.py now
