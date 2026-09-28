@@ -136,6 +136,29 @@ def cmd_persist(args):
         lock.close()
 
 
+def swap_only():
+    """One undo step for the GUI (`undo --swap-only`): swap monitors.lua and
+    .prev, reload, verify. If that doesn't verify, swap back, reload and
+    verify again. Exit status 0 = swapped and verified. The GUI asks its own
+    15 s question and runs this again to swap back."""
+    try:
+        durable.undo()
+    except FileNotFoundError as e:
+        die(str(e))
+    durable.reload_hyprland()
+    problems = durable.verify_durable(durable.load_json())
+    if not problems:
+        print("Swapped monitors.lua and monitors.lua.prev; reloaded and verified.")
+        return
+    print("The swapped-in rules didn't produce their layout: " + "; ".join(problems))
+    durable.undo()
+    durable.reload_hyprland()
+    back = durable.verify_durable(durable.load_json())
+    if back:
+        die("SWAP BACK DIDN'T VERIFY EITHER: " + "; ".join(back))
+    die("Swapped back; the layout is as it was before (verified).")
+
+
 def cmd_undo(args):
     """Undo the last durable Keep: swap monitors.lua and .prev, reload, verify,
     then the usual 15 s question; not confirming swaps back."""
@@ -143,6 +166,9 @@ def cmd_undo(args):
         die("durable Keep isn't set up (Hyprland with the dofile line in hyprland.lua)")
     lock = take_lock()
     try:
+        if args.swap_only:
+            swap_only()
+            return
         try:
             durable.undo()
         except FileNotFoundError as e:
@@ -614,6 +640,8 @@ def main():
     u = sub.add_parser("undo", help="undo the last permanent Keep (with the 15 s question)")
     u.add_argument("--auto-keep", action="store_true", help=argparse.SUPPRESS)
     u.add_argument("--auto-revert-after", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
+    # Hidden: one swap step, for the GUI's Undo (it asks its own question).
+    u.add_argument("--swap-only", action="store_true", help=argparse.SUPPRESS)
 
     p = sub.add_parser("set", help="change one output, with test + 15s auto-revert")
     p.add_argument("output", help="output name, e.g. DP-3 or eDP-1")

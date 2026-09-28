@@ -867,6 +867,11 @@ def undo(directory=DIR):
     atomic_write(lua, prev_lua)
 
 
+def undo_available(directory=DIR):
+    """True if there's a previous version to undo to (monitors.lua.prev)."""
+    return _paths(directory)[1].exists()
+
+
 def load_json(directory=DIR, prev=False):
     _, _, js, js_prev = _paths(directory)
     p = js_prev if prev else js

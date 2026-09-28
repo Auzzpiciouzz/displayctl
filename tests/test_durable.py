@@ -557,6 +557,11 @@ class U2Files(unittest.TestCase):
         self.assertEqual((self.dir / "monitors.lua").read_text(), b)
         self.assertEqual(durable.load_json(self.dir)["states"], both_on())
 
+    def test_undo_available_once_there_is_a_prev(self):
+        self.assertFalse(durable.undo_available(self.dir))
+        durable.keep(gen(docked_edp_off()), durable.kept_json(docked_edp_off(), DESC), self.dir)
+        self.assertTrue(durable.undo_available(self.dir))
+
     def test_undo_without_prev_refuses(self):
         with self.assertRaises(FileNotFoundError):
             durable.undo(self.dir)

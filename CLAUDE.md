@@ -72,6 +72,12 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   `hyprctl reload`, then verifies. Hyprland does NOT auto-reload our dofile'd
   file; `hyprctl reload` re-applies rules but not the hyprland.start autostarts.
   Layouts now survive reloads. `displayctl.py persist` / `undo`.
+  GUI: "Undo Keep" header button (enabled when idle, nothing pending and a
+  .prev exists) and an Undo button on the "Layout saved" toast (gui.py
+  KeepUndoer): runs `displayctl.py undo --swap-only` (swap, reload, verify;
+  swaps back itself if that fails), then its own 15 s question; Revert /
+  timeout runs the swap again. Not live-tested yet (it changes the live
+  file: needs the user).
 - Hyprland Lua API facts (0.56.2, found from L11 run 2 on 2026-09-28):
   - `hl.dsp.reload_config` does NOT exist. The template called it from
     c586405 until the L11-run-2 fix: every rescue reload threw inside a pcall

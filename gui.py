@@ -809,6 +809,124 @@ class Applier:
 # --- Window and application ---------------------------------------------------------
 
 
+class KeepUndoer:
+    """Undo the last permanent Keep from the GUI ("Undo Keep" button, and the
+    Undo button on the "Layout saved" toast).
+
+    The same steps as `displayctl.py undo`, split so the question is ours:
+      1. `displayctl.py undo --swap-only` (a subprocess, like persist):
+         monitors.lua <-> .prev, one reload, verify. If that doesn't verify,
+         it swaps back by itself and fails;
+      2. the 15 s "Keep the previous layout?" question (Enter, Esc and the
+         timeout all mean Revert, as in the Apply dialog);
+      3. Keep: done (Undo again = redo). Revert or timeout: the same command
+         again swaps back.
+    If the GUI dies during the question, the previous layout stays. It was
+    kept (confirmed) before, so that's a safe state; Undo again redoes.
+    """
+
+    def __init__(self, window):
+        self.window = window
+        self.busy = False
+        self.dialog = None
+        self._countdown_id = None
+        self._decided = False
+
+    @staticmethod
+    def available():
+        """Durable Keep is set up and there's a previous version to go back to."""
+        return (backend.on_hyprland() and durable.dofile_line_present()
+                and durable.undo_available())
+
+    def start(self):
+        if self.busy or self.window.applier.busy:
+            return
+        self.busy = True
+        self._decided = False
+        self.window.update_actions()
+        self.window.toast("Restoring the previous permanent layout…")
+        self._swap(self._after_first_swap)
+
+    def _swap(self, done):
+        """Run `displayctl.py undo --swap-only`; then done(ok, output)."""
+        script = str(Path(__file__).resolve().parent / "displayctl.py")
+        proc = Gio.Subprocess.new(
+            [sys.executable, script, "undo", "--swap-only"],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+
+        def finished(proc, result):
+            _, out, _ = proc.communicate_utf8_finish(result)
+            ok = proc.get_successful()
+            log.debug("undo --swap-only %s:\n%s", "ok" if ok else "FAILED", (out or "").strip())
+            done(ok, (out or "").strip())
+
+        proc.communicate_utf8_async(None, None, finished)
+
+    def _after_first_swap(self, ok, out):
+        if not ok:
+            self._finish()
+            self.window.alert("Couldn't undo the permanent layout", out)
+            return
+        self._ask()
+
+    # --- the "Keep the previous layout?" question ---
+
+    def _ask(self):
+        self._remaining = CONFIRM_SECONDS
+        self.dialog = self._present_question()
+        self._update_body()
+        self._countdown_id = GLib.timeout_add(1000, self._tick)  # ms: see Applier._ask
+
+    def _present_question(self):
+        dialog = Adw.AlertDialog(heading="Keep the previous permanent layout?")
+        dialog.add_response("revert", "Revert")
+        dialog.add_response("keep", "Keep Previous Layout")
+        dialog.set_response_appearance("keep", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("revert")    # Esc = Revert
+        dialog.set_default_response("revert")  # Enter = Revert
+        dialog.connect("response", lambda _d, response: self._decide(keep=(response == "keep")))
+        dialog.present(self.window)
+        return dialog
+
+    def _update_body(self):
+        self.dialog.set_body(f"Going back to the layout you kept before in {self._remaining} s.")
+
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self._countdown_id = None
+            self.dialog.force_close()  # closes without emitting "response"
+            self._decide(keep=False)
+            return GLib.SOURCE_REMOVE
+        self._update_body()
+        return GLib.SOURCE_CONTINUE
+
+    def _decide(self, keep):
+        if self._decided:  # timeout and a click can race; act only once
+            return
+        self._decided = True
+        if self._countdown_id is not None:
+            GLib.source_remove(self._countdown_id)
+            self._countdown_id = None
+        if keep:
+            self._finish()
+            self.window.toast("Previous layout kept (Undo Keep again to redo)")
+        else:
+            self._swap(self._after_swap_back)
+
+    def _after_swap_back(self, ok, out):
+        self._finish()
+        if ok:
+            self.window.toast("Back to the layout before the undo")
+        else:
+            self.window.alert("Couldn't go back", out)
+
+    def _finish(self):
+        self.busy = False
+        self.dialog = None
+        self.window.update_actions()
+
+
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app, om):
         super().__init__(application=app, title="Displays", default_width=1100, default_height=680)
@@ -816,6 +934,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.om = om
         self.pending = {}  # {head name: state}, see layout.py
         self.applier = Applier(self)
+        self.undoer = KeepUndoer(self)
 
         self.window_title = Adw.WindowTitle(title="Displays")
         header = Adw.HeaderBar(title_widget=self.window_title)
@@ -823,6 +942,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.reset_button.set_tooltip_text("Discard the changes you haven't applied")
         self.reset_button.connect("clicked", lambda *_: self.clear_pending())
         header.pack_start(self.reset_button)
+        self.undo_keep_button = Gtk.Button(label="Undo Keep")
+        self.undo_keep_button.set_tooltip_text(
+            "Go back to the permanent layout you kept before the last Keep")
+        self.undo_keep_button.connect("clicked", lambda *_: self.undoer.start())
+        header.pack_start(self.undo_keep_button)
         self.apply_button = Gtk.Button(label="Apply")
         self.apply_button.add_css_class("suggested-action")
         self.apply_button.connect("clicked", lambda *_: self.applier.start())
@@ -913,11 +1037,15 @@ class MainWindow(Adw.ApplicationWindow):
         self.canvas.queue_draw()
 
     def update_actions(self):
-        busy = self.applier.busy
+        busy = self.applier.busy or self.undoer.busy
         self.apply_button.set_sensitive(bool(self.pending) and not busy)
         self.reset_button.set_sensitive(bool(self.pending) and not busy)
         self.details.set_sensitive(not busy)
         self.canvas.set_sensitive(not busy)
+        # Undo Keep: only with nothing pending (it would discard the edits'
+        # meaning) and something to go back to.
+        self.undo_keep_button.set_sensitive(
+            not busy and not self.pending and KeepUndoer.available())
 
     def clear_pending(self):
         self.pending = {}
@@ -1097,7 +1225,11 @@ class DisplayctlApp(Adw.Application):
             self.persist_result = (ok, out or "")
             log.debug("persist %s:\n%s", "ok" if ok else "FAILED", (out or "").strip())
             if ok:
-                self.window.toast("Layout saved: it will survive a Hyprland reload")
+                toast = Adw.Toast(title="Layout saved: it will survive a Hyprland reload",
+                                  button_label="Undo", timeout=8)
+                toast.connect("button-clicked", lambda *_: self.window.undoer.start())
+                self.window.toasts.add_toast(toast)
+                self.window.update_actions()  # there's a .prev to undo to now
             else:
                 self.window.alert("Couldn't make the layout permanent",
                                   "The change is live, but a Hyprland reload would undo it.\n\n"
