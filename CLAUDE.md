@@ -47,8 +47,10 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   docs/hyprland-persistence.md).
 - "succeeded" doesn't prove anything happened: always re-read and verify.
 - kanshi: config at ~/.config/kanshi/config (profiles external / extend /
-  laptop / undocked; "external" disables eDP-1). hyprland.lua STARTS IT AT
-  LOGIN (`hl.exec_cmd("kanshi")`) — it runs after every boot until killed.
+  laptop / undocked; "external" disables eDP-1). REMOVED FROM AUTOSTART
+  2026-09-28 (the `hl.exec_cmd("kanshi")` line in hyprland.lua is commented
+  out, L10 passed). The notes below are why; they still apply if it's ever
+  started by hand.
   eDP-1's "disabled" state came from kanshi via the protocol, not a Hyprland
   rule, so any rule re-evaluation turns eDP-1 back on (catch-all = enabled).
   kanshi uses the same protocol as displayctl; don't run both. It stays
@@ -58,8 +60,9 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   print a warning; the GUI shows a banner, re-checked every 3 s
   (safety.kanshi_warning, exact match on /proc/<pid>/comm). kanshi's only
   unique features: Super+P (display-mode.sh -> `kanshictl switch
-  external|extend|laptop`) and eDP-1 off at a docked login. Recommended
-  2026-09-28: remove it from autostart together with L10.
+  external|extend|laptop`) and eDP-1 off at a docked login. The docked
+  login is now covered by the guarded monitors.lua (L10). Super+P is
+  BROKEN until display-mode.sh is ported to displayctl (in progress).
 - After a boot the protocol once said eDP-1 enabled while hyprctl said
   disabled; applying from that view turned eDP-1 on. Not reproduced by
   killing kanshi mid-session; suspected startup race. displayctl.py now
@@ -76,8 +79,11 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   .prev exists) and an Undo button on the "Layout saved" toast (gui.py
   KeepUndoer): runs `displayctl.py undo --swap-only` (swap, reload, verify;
   swaps back itself if that fails), then its own 15 s question; Revert /
-  timeout runs the swap again. Not live-tested yet (it changes the live
-  file: needs the user).
+  timeout runs the swap again. GUI Undo/Keep flow live-tested by the user
+  2026-09-28 (worked). Undo is ONE level deep: .prev is simply the file
+  before the last Keep (or the last undo's swap), so after a test sequence
+  it can be a small throwaway layout, not an older "good" one. Check
+  monitors.json.prev (`kept_at`, states) before a CLI undo.
 - Hyprland Lua API facts (0.56.2, found from L11 run 2 on 2026-09-28):
   - `hl.dsp.reload_config` does NOT exist. The template called it from
     c586405 until the L11-run-2 fix: every rescue reload threw inside a pcall
@@ -121,8 +127,9 @@ GTK gotcha: never rebuild a widget from inside its own change signal (hung
 GTK); gui.py handles edits from GLib.idle_add.
 
 ## Next steps (as of 2026-09-23)
-- Dev sessions: `pkill kanshi` first (it's autostarted and blocks other tools),
-  and don't use nwg-displays alongside (it's another output-management tool).
+- Dev sessions: kanshi is no longer autostarted (2026-09-28); if it's
+  running anyway, stop it by exact PID (it blocks other tools). Don't use
+  nwg-displays alongside (it's another output-management tool).
 1. DONE 2026-09-23: drag-to-arrange tests 2–8 passed live on the real GUI
    (tests/gui_live_arrange.py, 41/41 checks + SIGINT test; DP-3 returns to
    0,0 when eDP-1 is turned off; 15 s timeout measured 15.006 s).
@@ -160,7 +167,16 @@ GTK); gui.py handles edits from GLib.idle_add.
    normal dock/undock uses 1-2, and each plug event resets it. Manual
    `hyprctl reload` isn't counted. To clear the count by hand:
    `rm "$XDG_RUNTIME_DIR/displayctl-reload-count"`. 75 tests pass.
-   Still to do: L10 (startup, with kanshi commented out).
+   L11 run 4 PASSED 2026-09-28 (c3ea32b live): panel on ~1 s after the
+   unplug, gone-memory expiry re-check correct, replug correct, no crashes.
+   L10 PASSED 2026-09-28 (docked boot, kanshi removed from autostart):
+     14:26:13 load: monitors [] -> panel on
+     14:26:15 load: monitors [DP-3=Samsung...; eDP-1=BOE 0x0AAE] -> panel OFF
+   kanshi not running; DP-3 on, eDP-1 disabled; no ERROR lines.
+   Expected, not a bug: the FIRST startup load sees an EMPTY monitor list
+   (Hyprland hasn't added the outputs yet), so it correctly defaults to
+   panel ON ("any doubt: panel on"); ~2 s later a second load sees the
+   Samsung and turns the panel off. The panel is briefly on at a docked login.
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.
