@@ -8,6 +8,7 @@ Run: .venv/bin/python -m unittest discover -s tests
 import argparse
 import io
 import os
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -140,6 +141,51 @@ class CmdPreset(unittest.TestCase):
         cmd.assert_called_once()
         self.assertIsNone(cmd.call_args.args[0].self_revert_test)
         self.assertIn("WARNING: kanshi", err.getvalue())
+
+
+class RofiConfirm(unittest.TestCase):
+    """confirm() without a terminal asks in rofi (confirm_rofi); rofi is mocked."""
+
+    def ask(self, run=None, rofi="/usr/bin/rofi", wayland="wayland-1"):
+        env = {"WAYLAND_DISPLAY": wayland} if wayland else {}
+        with mock.patch("sys.stdin", io.StringIO()), \
+             mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch("shutil.which", return_value=rofi), \
+             mock.patch("subprocess.run", side_effect=run) as sp, \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            answer = displayctl.confirm(15)
+        return answer, sp, out.getvalue()
+
+    @staticmethod
+    def rofi_says(stdout, code=0):
+        return lambda *a, **kw: mock.Mock(returncode=code, stdout=stdout)
+
+    def test_keep_keeps(self):
+        answer, sp, _ = self.ask(self.rofi_says("Keep changes\n"))
+        self.assertTrue(answer)
+        cmd, kw = sp.call_args.args[0], sp.call_args.kwargs
+        self.assertEqual(kw["timeout"], 15)                   # rofi stopped at the deadline
+        self.assertEqual(cmd[cmd.index("-selected-row") + 1], "1")   # Revert pre-selected
+        self.assertIn("-no-custom", cmd)
+        self.assertEqual(kw["input"].splitlines(), ["Keep changes", "Revert"])
+
+    def test_everything_else_reverts(self):
+        for label, run in [
+            ("Revert chosen", self.rofi_says("Revert\n")),
+            ("Escape", self.rofi_says("", code=1)),
+            ("typed text", self.rofi_says("keep\n")),
+            ("timeout", mock.Mock(side_effect=subprocess.TimeoutExpired("rofi", 15))),
+            ("rofi won't start", mock.Mock(side_effect=OSError("boom"))),
+        ]:
+            answer, _, _ = self.ask(run)
+            self.assertFalse(answer, label)
+
+    def test_no_rofi_or_no_wayland_reverts_without_asking(self):
+        for kw in ({"rofi": None}, {"wayland": None}):
+            answer, sp, text = self.ask(self.rofi_says("Keep changes\n"), **kw)
+            self.assertFalse(answer)
+            sp.assert_not_called()
+            self.assertIn("reverting", text)
 
 
 if __name__ == "__main__":

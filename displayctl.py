@@ -24,6 +24,7 @@ import argparse
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import termios
@@ -335,12 +336,11 @@ def confirm(seconds):
     """Countdown prompt. True only if the user presses 'y' in time.
 
     The terminal goes into "cbreak" mode so a single key press is read
-    immediately (no Enter needed). Without a terminal we can't ask, so the
-    answer is "no" and the change reverts.
+    immediately (no Enter needed). Without a terminal (Super+P) the
+    question goes to rofi instead (confirm_rofi).
     """
     if not sys.stdin.isatty():
-        print("No terminal to confirm on: reverting.")
-        return False
+        return confirm_rofi(seconds)
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
@@ -359,6 +359,37 @@ def confirm(seconds):
     finally:
         # Always give the terminal back its normal settings.
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+ROFI_KEEP, ROFI_REVERT = "Keep changes", "Revert"
+
+
+def confirm_rofi(seconds):
+    """No terminal (e.g. started from Super+P): ask in a rofi menu instead.
+
+    True only if "Keep changes" is chosen in time. Escape, "Revert", closing
+    rofi or no answer in `seconds` all mean revert. rofi has no timeout
+    option, so subprocess.run stops it for us. "Revert" is pre-selected, so
+    a stray Enter doesn't keep a broken layout. The watchdog is still the
+    backup if this process dies while rofi is open.
+    """
+    rofi = shutil.which("rofi")
+    if rofi is None or not os.environ.get("WAYLAND_DISPLAY"):
+        print("No terminal or rofi to confirm with: reverting.")
+        return False
+    cmd = [rofi, "-dmenu", "-i", "-no-custom", "-selected-row", "1", "-p", "Display",
+           "-mesg", f"Keep these display settings? Reverting in {seconds} s."]
+    print(f"Asking in rofi (reverting in {seconds}s)...")
+    try:
+        out = subprocess.run(cmd, input=f"{ROFI_KEEP}\n{ROFI_REVERT}\n",
+                             capture_output=True, text=True, timeout=seconds)
+    except subprocess.TimeoutExpired:  # run() has already killed rofi
+        print("No answer in time: reverting.")
+        return False
+    except OSError as e:
+        print(f"Couldn't start rofi ({e}): reverting.")
+        return False
+    return out.returncode == 0 and out.stdout.strip() == ROFI_KEEP
 
 
 # --- set ---------------------------------------------------------------------------
