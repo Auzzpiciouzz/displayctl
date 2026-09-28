@@ -66,6 +66,34 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   `hyprctl reload`, then verifies. Hyprland does NOT auto-reload our dofile'd
   file; `hyprctl reload` re-applies rules but not the hyprland.start autostarts.
   Layouts now survive reloads. `displayctl.py persist` / `undo`.
+- Hyprland Lua API facts (0.56.2, found from L11 run 2 on 2026-09-28):
+  - `hl.dsp.reload_config` does NOT exist. The template called it from
+    c586405 until the L11-run-2 fix: every rescue reload threw inside a pcall
+    and never happened (the log showed "reload (...)" but never a "load:"
+    after it). Reload from Lua with `hl.exec_cmd("hyprctl reload")`.
+  - A runtime `hl.monitor({...})` (from a handler or timer) raises no
+    error but is NOT applied until the next reload or hotplug. Only a reload
+    changes outputs.
+  - When the last real monitor goes, Hyprland adds a `FALLBACK` output with
+    an empty description. eDP-1 while disabled is not in `hl.get_monitors()`.
+  - `hyprctl eval` prints only "ok", never a return value. To see one, have
+    the Lua write it to a file.
+  - L11 run 1's "stale list" diagnosis is probably incomplete: its reload
+    never ran either.
+- The mock in durable.py (MOCK_DRIVER) must follow the REAL API. The old mock
+  invented `hl.dsp.reload_config`, which is why U1 passed while the live file
+  was broken. tests/test_durable.py REAL_HL / REAL_HL_DSP is the allow-list
+  of names the template may call (comments are ignored). After a Hyprland
+  update, regenerate it from the live session and paste the two lines in:
+  ```
+  hyprctl eval "local f=io.open('/tmp/hl-api.txt','w'); local function keys(t) local r={} for k in pairs(t) do r[#r+1]=tostring(k) end table.sort(r) return table.concat(r,' ') end; f:write('hl: ',keys(hl),'\n'); f:write('dsp: ',keys(hl.dsp),'\n'); f:close()"
+  cat /tmp/hl-api.txt
+  ```
+  (It is read-only: it only lists names.) If a name the template uses has
+  gone, the allow-list test fails. Fix the template and the mock together.
+- Generated monitors.lua logs its own errors as "ERROR in <where>: ..." in
+  $XDG_RUNTIME_DIR/displayctl-monitors.log (load, timers, event handlers). A
+  syntax error can only be seen by hyprland.lua's pcall around dofile.
 
 ## Stack
 Python 3, PyGObject (GTK4 + libadwaita), pywayland.
@@ -94,6 +122,14 @@ GTK); gui.py handles edits from GLib.idle_add.
    restore the old no-guard file with `displayctl.py undo`. No other
    Keeps with eDP-1 off until L11 passes. Re-run L11 with the recorder
    started BEFORE the unplug; L10 later (comment out kanshi).
+   2026-09-28: L11 run 2 FAILED (panel stayed black after the unplug). Root
+   cause: the rescue reload called the nonexistent hl.dsp.reload_config (see
+   "Hyprland Lua API facts"). Fixed to `hyprctl reload`, with errors now
+   logged. Mock and tests follow the real API: 72 tests pass. KNOWN: if even
+   a reload can't bring the panel back, the file retries a reload about
+   every 5.6 s for as long as the screen is black (rate-limited, count not
+   capped; test_worst_case_reloads_stay_rate_limited). NOT yet deployed:
+   next is persist + L11 run 3.
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.

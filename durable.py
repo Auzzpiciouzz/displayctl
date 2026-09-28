@@ -147,6 +147,20 @@ local function log(msg)
   end)
 end
 
+-- Run fn(...) and log any error instead of losing it. Hyprland's pcall around
+-- our dofile, and our own pcalls around timer callbacks, would otherwise hide
+-- it (in L11 run 2 a failing reload call left no trace in this log).
+local function run_logged(where, fn, ...)
+  local ok, err = pcall(fn, ...)
+  if not ok then log("ERROR in " .. where .. ": " .. tostring(err)) end
+  return ok
+end
+
+-- Everything below runs inside run_logged("load", ...) so a load error is
+-- logged too (not indented, to keep the diff readable). A syntax error can't
+-- be caught from inside this file; only hyprland.lua's pcall sees that one.
+run_logged("load", function()
+
 local function field(m, key)
   local ok, v = pcall(function() return m[key] end)
   if ok then return v end
@@ -257,11 +271,11 @@ local function after(ms, fn)
     local t
     t = hl.timer(function()
       pcall(function() t:set_enabled(false) end)
-      pcall(fn)
+      run_logged("timer", fn)
     end, { timeout = ms, type = "repeat" })
     table.insert(timers, t)
   end)
-  if not ok then pcall(fn) end  -- no timers available: act right away
+  if not ok then run_logged("timer (run at once)", fn) end  -- no timers available: act right away
 end
 
 local function seconds_since_reload()
@@ -288,16 +302,22 @@ local function request_reload(reason)
     if f then f:write(tostring(os.time()), "\n"); f:close() end
   end)
   log("reload (" .. reason .. ")")
-  hl.dispatch(hl.dsp.reload_config())
+  -- Hyprland 0.56.2's Lua API has no reload dispatcher (hl.dsp.reload_config
+  -- is nil: calling it threw, silently, in L11 run 2). Running `hyprctl reload`
+  -- is what Keep uses too; it re-runs hyprland.lua and so this file.
+  hl.exec_cmd("hyprctl reload")
 end
 
 local function enable_panels_now(reason)
+  -- Best effort only: on 0.56.2 a monitor rule added at runtime is stored but
+  -- not applied (L11 run 2: no error, panel stayed off). The reload below is
+  -- the real rescue; this stays in case a later Hyprland applies it at once.
   for _, panel in ipairs(PANELS) do
     local ok = pcall(hl.monitor, { output = panel, mode = "preferred", position = "auto", scale = 1 })
     log("panel " .. panel .. " ON directly (" .. reason .. ")" .. (ok and "" or " [hl.monitor failed]"))
   end
-  -- If the direct rule didn't take effect, reload (the load then honours the
-  -- "gone" memory, so it won't turn the panel off again).
+  -- The direct rule usually doesn't take effect, so reload (the load then
+  -- honours the "gone" memory, so it won't turn the panel off again).
   after(1000, function()
     if not panel_listed() then request_reload("panel still off after direct enable") end
   end)
@@ -362,13 +382,15 @@ local function on_added(m)
   after(3000, function() recheck("3 s after addition") end)
 end
 
-pcall(hl.on, "monitor.added", on_added)
-pcall(hl.on, "monitor.removed", on_removed)
+pcall(hl.on, "monitor.added", function(m) run_logged("monitor.added", on_added, m) end)
+pcall(hl.on, "monitor.removed", function(m) run_logged("monitor.removed", on_removed, m) end)
 
 -- After every load: re-check once things have settled (also enforces the
 -- "never zero screens" invariant after a reload).
 after(2500, function() recheck("2.5 s after load") end)
-recheck_when_memory_expires()"""
+recheck_when_memory_expires()
+
+end)  -- run_logged("load", ...)"""
 
 
 def kept_json(states, descriptions, now=None):
@@ -398,6 +420,8 @@ def kept_json(states, descriptions, now=None):
 #                        at = seconds after the load, slow = seconds that
 #                        hl.get_monitors keeps returning the OLD list }
 #   SC_DIRECT    whether a runtime hl.monitor(...) turning the panel on works
+#   SC_PANEL_START  false: the panel is off (not listed) during the FIRST load
+#   SC_RELOAD_FIXES false: reloads never turn the panel back on (worst case)
 #   SC_RUN_FOR   simulated seconds
 # The panel (eDP-1) is listed by get_monitors while it's on. A reload re-runs
 # the file in a fresh state (old timers/handlers gone, catch-all turns the
@@ -455,9 +479,13 @@ hl = {
     return out
   end,
   on = function(name, fn) handlers[name] = fn end,
-  dsp = { reload_config = function() return "RELOAD" end },
-  dispatch = function(x)
-    if x == "RELOAD" then
+  -- Shaped like the real 0.56.2 API (hl.dsp has NO reload_config: calling it
+  -- errors, as it did live in L11 run 2). The only reload that works from Lua
+  -- is running `hyprctl reload`.
+  dsp = { exec_cmd = function(cmd) return { exec = cmd } end },
+  dispatch = function(x) if type(x) == "table" and x.exec then hl.exec_cmd(x.exec) end end,
+  exec_cmd = function(cmd)
+    if cmd == "hyprctl reload" then
       reloads = reloads + 1
       table.insert(reload_at, string.format("%.1f", CLOCK - T0))
       reload_requested = true
@@ -477,6 +505,8 @@ local function load()
   for _, t in ipairs(timers) do t.enabled = false end  -- a reload destroys the old Lua state
   timers, handlers = {}, {}
   panel_on = true                                       -- the catch-all rule
+  if loads == 0 and SC_PANEL_START == false then panel_on = false end
+  if loads > 0 and SC_RELOAD_FIXES == false then panel_on = false end  -- panel won't come on
   loads = loads + 1
   loading = true
   dofile(SC_FILE)
@@ -581,7 +611,8 @@ class MockResult:
 
 
 def run_mock(lua_text, before, timers=True, event=None, lua="lua", stamp_age=None,
-             direct_works=True, run_for=20, gone=None):
+             direct_works=True, run_for=20, gone=None, panel_start=True,
+             reload_fixes=True):
     """Run generated Lua against the mock (see MOCK_DRIVER). Returns MockResult.
 
     stamp_age: pretend the last handler reload was this many seconds ago.
@@ -595,7 +626,9 @@ def run_mock(lua_text, before, timers=True, event=None, lua="lua", stamp_age=Non
                    f"SC_TIMERS = {lua_value(timers)}\n"
                    f"SC_EVENT = {lua_value(event)}\n"
                    f"SC_DIRECT = {lua_value(direct_works)}\n"
-                   f"SC_RUN_FOR = {lua_value(run_for)}\n")
+                   f"SC_RUN_FOR = {lua_value(run_for)}\n"
+                   f"SC_PANEL_START = {lua_value(panel_start)}\n"
+                   f"SC_RELOAD_FIXES = {lua_value(reload_fixes)}\n")
         driver = Path(tmp) / "driver.lua"
         driver.write_text(prelude + MOCK_DRIVER)
         t0 = 1000000  # the mock's clock start (os.time() inside the mock)

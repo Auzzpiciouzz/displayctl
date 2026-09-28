@@ -308,6 +308,115 @@ class U1Undock(unittest.TestCase):
             self.assertIn(needle, r.log)
 
 
+FALLBACK = {"name": "FALLBACK", "description": ""}
+
+# Names in `hl` and `hl.dsp` on the real Hyprland 0.56.2, dumped live on
+# 2026-09-28 with `hyprctl eval` (pairs(hl), pairs(hl.dsp)).
+REAL_HL = set("""animation bind clear_crashed_lockscreen config curve define_submap device
+dispatch dsp env exec_cmd exec_scheduled_prop_refresh_immediately gesture get_active_monitor
+get_active_special_workspace get_active_window get_active_workspace get_config
+get_current_submap get_cursor_pos get_last_window get_last_workspace get_layers
+get_loaded_plugins get_monitor get_monitor_at get_monitor_at_cursor get_monitors
+get_urgent_window get_window get_windows get_workspace get_workspace_windows get_workspaces
+is_key_down layer_rule layout monitor notification on permission plugin timer unbind version
+window_rule workspace_rule""".split())
+REAL_HL_DSP = set("""cursor dpms event exec_cmd exec_raw exit focus force_idle
+force_renderer_reload global group layout no_op pass release_input_capture send_key_state
+send_shortcut submap window workspace""".split())
+
+
+class U1L11Run2(unittest.TestCase):
+    """L11 run 2 (2026-09-28, afb4275 live): after the unplug only Hyprland's
+    FALLBACK output (empty description) was listed, eDP-1 was off (so not
+    listed), the direct enable had no effect, and six "reload" lines were
+    never followed by a "load:" line."""
+
+    def test_template_calls_only_functions_that_exist(self):
+        import re
+        text = re.sub(r"--[^\n]*", "", durable.GUARD_TEMPLATE)   # code only, not comments
+        used_dsp = set(re.findall(r"\bhl\.dsp\.(\w+)", text))
+        used_hl = set(re.findall(r"\bhl\.(\w+)", text))
+        self.assertEqual(used_dsp - REAL_HL_DSP, set(), "hl.dsp.* names that don't exist")
+        self.assertEqual(used_hl - REAL_HL, set(), "hl.* names that don't exist")
+
+    def test_load_with_only_fallback_listed_does_not_throw(self):
+        # The exact state at 13:18:57: list = [FALLBACK=""], eDP-1 absent,
+        # the Samsung remembered as gone 1 s ago.
+        for lua in INTERPRETERS:
+            with self.subTest(lua=lua):
+                r = durable.run_mock(gen(docked_edp_off()), [FALLBACK], lua=lua,
+                                     panel_start=False, gone={SAMSUNG: 1},
+                                     direct_works=False, run_for=10)
+                self.assertIn("load: monitors [FALLBACK=] -> panel on", r.log)
+                self.assertNotIn("ERROR in load", r.log)
+                self.assertFalse(r.panel_disabled_at_load())
+
+    def test_run2_sequence_panel_comes_back(self):
+        # The full run-2 sequence: docked, Samsung unplugged, only FALLBACK
+        # left, runtime hl.monitor has no effect (as seen live).
+        for lua in INTERPRETERS:
+            with self.subTest(lua=lua):
+                r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, direct_works=False,
+                                     run_for=40, event={"name": "monitor.removed", "monitor": DP3,
+                                                        "after": [FALLBACK], "at": 1})
+                self.assertNotIn("ERROR", r.log)
+                self.assertGreaterEqual(r.loads, 2, "the rescue reload never re-ran the file")
+                self.assertTrue(r.panel_on)
+                self.assertLessEqual(r.black, 1.5)
+
+    def run2(self, lua, slow=0, **kw):
+        return durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, direct_works=False,
+                                event={"name": "monitor.removed", "monitor": DP3,
+                                       "after": [FALLBACK], "at": 1, "slow": slow}, **kw)
+
+    def test_run2_reloads_are_bounded_over_90_s(self):
+        # Reloads now really happen, so the throttle/postpone logic runs for
+        # real. The run-2 unplug must settle, not keep reloading.
+        for lua in INTERPRETERS:
+            for slow in (0, 3, 8, 20):
+                with self.subTest(lua=lua, slow=slow):
+                    r = self.run2(lua, slow, run_for=90)
+                    self.assertLessEqual(r.reloads, 2)
+                    self.assertEqual(r.loads, r.reloads + 1)   # every reload re-ran the file
+                    self.assertEqual(r.pending, 0)             # nothing left scheduled
+                    self.assertTrue(r.panel_on)
+
+    def test_mock_reload_destroys_old_timers_and_reruns_the_load(self):
+        # Like the real `hyprctl reload`: a fresh load, and the old load's
+        # timers never fire again (they'd still say "loaded with panel OFF").
+        r = self.run2(INTERPRETERS[0], run_for=90)
+        lines = r.log.splitlines()
+        first_reload = next(i for i, l in enumerate(lines) if l.split("] ", 1)[1].startswith("reload ("))
+        after_reload = lines[first_reload + 1:]
+        self.assertIn("load: monitors [", after_reload[0])
+        self.assertIn("-> panel on", after_reload[0])
+        self.assertFalse([l for l in after_reload if "loaded with panel OFF" in l])
+
+    def test_worst_case_reloads_stay_rate_limited(self):
+        # If even a reload can't bring the panel back, the "never zero screens"
+        # rule keeps retrying. KNOWN: the count isn't capped (about one reload
+        # per MIN_GAP + ~0.6 s, for as long as the screen stays black), but two
+        # reloads are never closer than MIN_GAP (5 s).
+        for lua in INTERPRETERS:
+            with self.subTest(lua=lua):
+                r = self.run2(lua, run_for=90, reload_fixes=False)
+                gaps = [b - a for a, b in zip(r.reload_at, r.reload_at[1:])]
+                self.assertTrue(gaps)
+                self.assertGreaterEqual(min(gaps), 4.5)   # RELOAD_AT is rounded to 0.1 s
+                self.assertLessEqual(r.reloads, 90 // 5 + 1)
+
+    def test_errors_in_callbacks_are_logged(self):
+        # A callback that throws must leave a line in the log, not vanish.
+        text = gen(docked_edp_off()).replace(
+            'recheck("1 s after removal")', 'error("boom")')
+        r = undock(0, lua=INTERPRETERS[0], run_for=5, direct_works=False)
+        self.assertNotIn("boom", r.log)
+        r = durable.run_mock(text, [DP3], lua=INTERPRETERS[0], run_for=5, event={
+            "name": "monitor.removed", "monitor": DP3, "after": [], "at": 1})
+        self.assertIn("ERROR in timer:", r.log)
+        self.assertIn("boom", r.log)
+
+
 class U2Files(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

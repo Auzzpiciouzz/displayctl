@@ -136,8 +136,11 @@ config loads, so the file also registers `hl.on("monitor.added")` and
   panel on/off would otherwise trigger them);
 - for an external monitor, the guard is re-checked 1 s later (monitor list
   settled; `hl.timer`, or immediately if timers aren't available), and the
-  config is reloaded (`hl.dispatch(hl.dsp.reload_config())`) only if the
-  answer differs from what this load applied;
+  config is reloaded (`hl.exec_cmd("hyprctl reload")`) only if the
+  answer differs from what this load applied. (Until 2026-09-28 this said
+  `hl.dispatch(hl.dsp.reload_config())`, but that dispatcher doesn't exist
+  in 0.56.2, so the reload silently never happened. That is why L11 run 2
+  failed.);
 - no loops: right after a reload the answer equals what that load applied;
   backstop: at most one reload per 5 s (timestamp in
   `$XDG_RUNTIME_DIR/displayctl-reload-stamp`); a blocked check is postponed,
@@ -563,8 +566,10 @@ installed 0.56.2 binary contains the same event names):
   disable with `hl.monitor({ output = "eDP-1", disabled = true })`;
   catch-all `hl.monitor({ output = "", mode = "preferred", position =
   "auto", scale = 1 })`.
-- Reload: `hyprctl reload`, or the `reload_config()` dispatcher. Hyprland
-  also auto-reloads when a config file is saved (`disable_autoreload`).
+- Reload: `hyprctl reload` (from Lua: `hl.exec_cmd("hyprctl reload")`).
+  There is NO `reload_config()` dispatcher in 0.56.2 (checked live
+  2026-09-28). Hyprland also auto-reloads when a config file is saved
+  (`disable_autoreload`), but not for our dofile'd file.
 
 Sketch (to be written in our monitors.lua, loaded by the user's dofile):
 
@@ -584,9 +589,11 @@ hl.on("monitor.removed", apply_dock_profile)
 
 Open points before implementing:
 - Exact fields of the Lua Monitor object (name, description, make/model?).
-- Whether calling `hl.monitor(...)` inside an event handler takes effect
-  immediately or needs `reload_config()`, and whether that reload loops
-  back into `monitor.layout_changed` / our handlers (guard against loops).
+- ANSWERED 2026-09-28 (L11 run 2): `hl.monitor(...)` inside an event
+  handler or timer is NOT applied until a reload (`hyprctl reload`). Still
+  open: whether that reload loops back into `monitor.layout_changed` / our
+  handlers (guard against loops; the guard's throttle is tested in
+  tests/test_durable.py U1L11Run2).
 - The eDP-1 rule: disabling eDP-1 while docked must be conditional inside
   the handler, never a static rule, so an undocked boot always has a
   screen (hard rule above still applies).
