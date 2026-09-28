@@ -114,15 +114,28 @@ GTK); gui.py handles edits from GLib.idle_add.
 1. DONE 2026-09-23: drag-to-arrange tests 2–8 passed live on the real GUI
    (tests/gui_live_arrange.py, 41/41 checks + SIGINT test; DP-3 returns to
    0,0 when eDP-1 is turned off; 15 s timeout measured 15.006 s).
-2. Durable Keep: implemented; U1/U2 + L1-L9 passed. L11 (physical unplug)
-   FAILED 2026-09-23 (panel stayed black); fix built + unit-tested, NOT yet
-   live-tested. 2026-09-27: the fixed template (afb4275) was deployed with
-   `displayctl.py persist` for L11: the live file HAS the guarded eDP-1
-   disable + undock handlers (Samsung, 1440p@200 at 0,0). If L11 fails,
-   restore the old no-guard file with `displayctl.py undo`. No other
-   Keeps with eDP-1 off until L11 passes. Re-run L11 with the recorder
-   started BEFORE the unplug; L10 later (comment out kanshi).
-   2026-09-28: L11 run 2 FAILED (panel stayed black after the unplug). Root
+2. Durable Keep: implemented; U1/U2 + L1-L9 passed; L11 PASSED 2026-09-28
+   (run 3, c5fcfab live, kanshi stopped, coredumpctl clean). Already wired
+   in: GUI Keep -> persist_async() (gui.py), CLI Keep -> make_durable()
+   (displayctl.py). The live file has the guarded eDP-1 disable + undock
+   handlers (Samsung, 1440p@200 at 0,0). Keeps with eDP-1 off are OK again.
+   L11 run 3 log summary (two unplug/replug cycles, 13:50 and 13:52):
+   - Unplug: event carried the description; "remembered as gone"; the direct
+     enable had no effect (as expected on 0.56.2); 1 s later "reload 1/10"
+     -> "load: monitors [FALLBACK=] -> panel on" -> "event monitor.added
+     eDP-1". Panel on about 1-2 s after the unplug; no further reloads.
+   - Gone-memory expiry (second cycle, replugged after 50 s): the re-check at
+     +31 s saw eDP-1 on ("real monitors on 1") and correctly did nothing.
+   - Replug: "reload count reset (monitor DP-3 added/removed)", 1 s later
+     "reload 1/10" -> "load: ... -> panel OFF" -> eDP-1 removed. Docked
+     layout back, one reload.
+   - No ERROR lines. Each cycle: 1 reload out, 1 reload back.
+   - "event monitor.removed FALLBACK" appears TWICE per cycle. Hyprland
+     emits it twice. Our handlers aren't doubled: every other event is
+     logged once, and run 2 shows the same double with a single load and no
+     reloads. Harmless: only duplicate re-checks.
+   History: L11 run 1 (2026-09-23) and run 2 (2026-09-28, afb4275) FAILED.
+   Run 2 (panel stayed black after the unplug). Root
    cause: the rescue reload called the nonexistent hl.dsp.reload_config (see
    "Hyprland Lua API facts"). Fixed to `hyprctl reload`, with errors now
    logged. Mock and tests follow the real API. Reload cap: at most 10
@@ -134,8 +147,8 @@ GTK); gui.py handles edits from GLib.idle_add.
    The cap counts every reload the file starts, not only panel rescues:
    normal dock/undock uses 1-2, and each plug event resets it. Manual
    `hyprctl reload` isn't counted. To clear the count by hand:
-   `rm "$XDG_RUNTIME_DIR/displayctl-reload-count"`. 75 tests pass. NOT yet
-   deployed: next is persist + L11 run 3.
+   `rm "$XDG_RUNTIME_DIR/displayctl-reload-count"`. 75 tests pass.
+   Still to do: L10 (startup, with kanshi commented out).
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.
