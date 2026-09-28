@@ -62,7 +62,8 @@ Extend / Duplicate / Only-show-on-1/2, auto dock profiles, 15s "keep changes?" a
   unique features: Super+P (display-mode.sh -> `kanshictl switch
   external|extend|laptop`) and eDP-1 off at a docked login. The docked
   login is now covered by the guarded monitors.lua (L10). Super+P is
-  BROKEN until display-mode.sh is ported to displayctl (in progress).
+  ported (2026-09-28): display-mode.sh -> `displayctl.py preset
+  external|extend` (see Next steps 3).
 - After a boot the protocol once said eDP-1 enabled while hyprctl said
   disabled; applying from that view turned eDP-1 on. Not reproduced by
   killing kanshi mid-session; suspected startup race. displayctl.py now
@@ -166,7 +167,7 @@ GTK); gui.py handles edits from GLib.idle_add.
    The cap counts every reload the file starts, not only panel rescues:
    normal dock/undock uses 1-2, and each plug event resets it. Manual
    `hyprctl reload` isn't counted. To clear the count by hand:
-   `rm "$XDG_RUNTIME_DIR/displayctl-reload-count"`. 75 tests pass.
+   `rm "$XDG_RUNTIME_DIR/displayctl-reload-count"`.
    L11 run 4 PASSED 2026-09-28 (c3ea32b live): panel on ~1 s after the
    unplug, gone-memory expiry re-check correct, replug correct, no crashes.
    L10 PASSED 2026-09-28 (docked boot, kanshi removed from autostart):
@@ -177,7 +178,29 @@ GTK); gui.py handles edits from GLib.idle_add.
    (Hyprland hasn't added the outputs yet), so it correctly defaults to
    panel ON ("any doubt: panel on"); ~2 s later a second load sees the
    Samsung and turns the panel off. The panel is briefly on at a docked login.
-3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
+3. Super+P presets (2026-09-28, edaebc7 + f57eb0f; dotfiles 7faf570).
+   `displayctl.py preset external|extend`: build_preset() makes EVERY
+   head's state in one configuration, then the same safe path as `set`
+   (apply_and_confirm: guard, snapshot, watchdog, apply, verify, ask,
+   Keep -> make_durable). external = panel off, externals from 0,0;
+   extend = panel LEFT (0,0), externals to its right (user's choice, as
+   kanshi had it). A head already on keeps its mode/scale/rotation; one
+   being turned on gets best_mode() (preferred size, highest refresh;
+   the Samsung marks no mode preferred, so its first-listed 1440p -> @200).
+   Without a terminal, confirm() asks in rofi (confirm_rofi): "Revert"
+   pre-selected, killed after 15 s; only "Keep changes" keeps.
+   display-mode.sh logs to $XDG_RUNTIME_DIR/display-mode.log and sends a
+   notification on failure.
+   Laptop only is LEFT OUT until Phase 4: disabling the Samsung through
+   the protocol fires monitor.removed with its description, which the
+   guarded monitors.lua can't tell from an unplug. The 1 s re-check then
+   reloads, the DP-3 rule turns it back on, and ~31 s later the panel goes
+   off again. Needs an override that the Lua honours (dock daemon).
+   NOT live-tested yet: a Keep rewrites the live monitors.lua (needs the
+   user). Test: Super+P -> Extend -> Keep, then Super+P -> External only
+   -> Keep; also Revert and a 15 s timeout.
+   118 tests pass.
+4. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.
 - Later: test i3 in tests/test_durable.py disables the "gone" memory by
