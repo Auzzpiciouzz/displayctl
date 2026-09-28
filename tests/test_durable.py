@@ -304,7 +304,7 @@ class U1Undock(unittest.TestCase):
     def test_r_log_records_loads_events_and_decisions(self):
         r = undock(3, lua=INTERPRETERS[0])
         for needle in ("load: monitors", "event monitor.removed DP-3", "ON directly",
-                       "check (1 s after removal)", "reload (", "-> panel on"):
+                       "check (1 s after removal)", "reload 1/10 (", "-> panel on"):
             self.assertIn(needle, r.log)
 
 
@@ -386,24 +386,63 @@ class U1L11Run2(unittest.TestCase):
         # timers never fire again (they'd still say "loaded with panel OFF").
         r = self.run2(INTERPRETERS[0], run_for=90)
         lines = r.log.splitlines()
-        first_reload = next(i for i, l in enumerate(lines) if l.split("] ", 1)[1].startswith("reload ("))
+        first_reload = next(i for i, l in enumerate(lines) if l.split("] ", 1)[1].startswith("reload 1/10 ("))
         after_reload = lines[first_reload + 1:]
         self.assertIn("load: monitors [", after_reload[0])
         self.assertIn("-> panel on", after_reload[0])
         self.assertFalse([l for l in after_reload if "loaded with panel OFF" in l])
 
-    def test_worst_case_reloads_stay_rate_limited(self):
+    def test_worst_case_stops_after_10_reloads(self):
         # If even a reload can't bring the panel back, the "never zero screens"
-        # rule keeps retrying. KNOWN: the count isn't capped (about one reload
-        # per MIN_GAP + ~0.6 s, for as long as the screen stays black), but two
-        # reloads are never closer than MIN_GAP (5 s).
+        # rule keeps asking for reloads. They stay MIN_GAP (5 s) apart, and
+        # after 10 the file gives up (and schedules nothing more).
         for lua in INTERPRETERS:
             with self.subTest(lua=lua):
-                r = self.run2(lua, run_for=90, reload_fixes=False)
+                r = self.run2(lua, run_for=300, reload_fixes=False)
+                self.assertEqual(r.reloads, 10)
+                self.assertEqual(r.loads, 11)
+                self.assertIn("reload 10/10 (", r.log)
+                self.assertNotIn("reload 11/10", r.log)
+                self.assertIn("giving up after 10 reloads", r.log)
                 gaps = [b - a for a, b in zip(r.reload_at, r.reload_at[1:])]
-                self.assertTrue(gaps)
                 self.assertGreaterEqual(min(gaps), 4.5)   # RELOAD_AT is rounded to 0.1 s
-                self.assertLessEqual(r.reloads, 90 // 5 + 1)
+                self.assertEqual(r.pending, 0)
+
+    def test_giving_up_blocks_reloads_until_an_event(self):
+        # Count already at the cap, no event: the rescue is refused.
+        r = durable.run_mock(gen(docked_edp_off()), [FALLBACK], lua=INTERPRETERS[0],
+                             panel_start=False, reload_count=10, run_for=30, direct_works=False)
+        self.assertEqual(r.reloads, 0)
+        self.assertIn("giving up after 10 reloads", r.log)
+
+    def test_real_monitor_event_resets_the_count(self):
+        # Count at the cap, then the Samsung (identifiable or not) is unplugged:
+        # a fresh set of attempts, so the panel is rescued.
+        for monitor in (DP3, "destroyed"):
+            for lua in INTERPRETERS:
+                with self.subTest(lua=lua, monitor=str(monitor)):
+                    r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, direct_works=False,
+                                         reload_count=10, run_for=40, event={
+                                             "name": "monitor.removed", "monitor": monitor,
+                                             "after": [FALLBACK], "at": 1})
+                    self.assertIn("reload count reset", r.log)
+                    self.assertIn("reload 1/10 (", r.log)
+                    self.assertTrue(r.panel_on)
+                    self.assertLessEqual(r.black, 1.5)
+
+    def test_panel_and_fallback_events_do_not_reset_the_count(self):
+        # These outputs come and go BECAUSE of our reloads; resetting on them
+        # could turn the cap into an endless loop.
+        for monitor in (FALLBACK, EDP):
+            for name in ("monitor.added", "monitor.removed"):
+                with self.subTest(monitor=monitor["name"], event=name):
+                    r = durable.run_mock(gen(docked_edp_off()), [FALLBACK], lua=INTERPRETERS[0],
+                                         panel_start=False, reload_count=10, run_for=30, direct_works=False,
+                                         event={"name": name, "monitor": monitor,
+                                                "after": [FALLBACK], "at": 1})
+                    self.assertEqual(r.reloads, 0)
+                    self.assertNotIn("reload count reset", r.log)
+                    self.assertIn("giving up after 10 reloads", r.log)
 
     def test_errors_in_callbacks_are_logged(self):
         # A callback that throws must leave a line in the log, not vanish.

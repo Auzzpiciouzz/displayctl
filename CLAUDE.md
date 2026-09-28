@@ -125,11 +125,17 @@ GTK); gui.py handles edits from GLib.idle_add.
    2026-09-28: L11 run 2 FAILED (panel stayed black after the unplug). Root
    cause: the rescue reload called the nonexistent hl.dsp.reload_config (see
    "Hyprland Lua API facts"). Fixed to `hyprctl reload`, with errors now
-   logged. Mock and tests follow the real API: 72 tests pass. KNOWN: if even
-   a reload can't bring the panel back, the file retries a reload about
-   every 5.6 s for as long as the screen is black (rate-limited, count not
-   capped; test_worst_case_reloads_stay_rate_limited). NOT yet deployed:
-   next is persist + L11 run 3.
+   logged. Mock and tests follow the real API. Reload cap: at most 10
+   file-started reloads in a row (count in $XDG_RUNTIME_DIR/
+   displayctl-reload-count, since every reload wipes the Lua state), then the
+   log says "giving up after 10 reloads". Any real or unidentifiable monitor
+   added/removed resets the count. The panel's own events and FALLBACK/
+   HEADLESS do NOT reset it, because they happen because of our reloads.
+   The cap counts every reload the file starts, not only panel rescues:
+   normal dock/undock uses 1-2, and each plug event resets it. Manual
+   `hyprctl reload` isn't counted. To clear the count by hand:
+   `rm "$XDG_RUNTIME_DIR/displayctl-reload-count"`. 75 tests pass. NOT yet
+   deployed: next is persist + L11 run 3.
 3. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
 - Later: docs/upstream-issue.md is a DRAFT; review before filing.

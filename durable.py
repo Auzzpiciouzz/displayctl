@@ -121,7 +121,9 @@ GUARD_TEMPLATE = r"""-- 3. Laptop panel(s) OFF only while a monitor the layout w
 --    b) "never zero screens": after every load, event and re-check, if no
 --       real monitor is on (FALLBACK/headless don't count) -> panel ON;
 --    c) delayed re-checks after loads and events, reload if the answer
---       changed (at most one reload per MIN_GAP s, postponed not dropped);
+--       changed (at most one reload per MIN_GAP s, postponed not dropped;
+--       at most MAX_RELOADS in a row, the count resets on any real monitor
+--       being added or removed);
 --    d) a diagnostic log of every load, event and decision.
 --    Any error or doubt: the panel stays / comes ON.
 local PANELS = { @PANELS@ }
@@ -131,7 +133,9 @@ local RUNDIR = os.getenv("XDG_RUNTIME_DIR") or "/tmp"
 local LOGFILE = RUNDIR .. "/displayctl-monitors.log"
 local GONE_FILE = RUNDIR .. "/displayctl-gone"
 local STAMP = RUNDIR .. "/displayctl-reload-stamp"
+local COUNT_FILE = RUNDIR .. "/displayctl-reload-count"
 local MIN_GAP, GONE_TTL, LOG_MAX = 5, 30, 262144
+local MAX_RELOADS = 10
 
 local function log(msg)
   pcall(function()
@@ -290,7 +294,37 @@ local function seconds_since_reload()
   return os.time() - n
 end
 
+-- How many reloads this file has started since the last real monitor was
+-- added or removed. Kept in a file because every reload starts a fresh Lua
+-- state. Without a cap, a panel that never comes back (even after a reload)
+-- would mean one reload every ~5.6 s forever.
+local function reload_count()
+  local ok, n = pcall(function()
+    local f = io.open(COUNT_FILE, "r")
+    if not f then return 0 end
+    local v = tonumber(f:read("*l"))
+    f:close()
+    return v
+  end)
+  if ok and n then return n end
+  return 0
+end
+
+local function set_reload_count(n)
+  pcall(function()
+    local f = io.open(COUNT_FILE, "w")
+    if f then f:write(tostring(n), "\n"); f:close() end
+  end)
+end
+
 local function request_reload(reason)
+  local count = reload_count()
+  if count >= MAX_RELOADS then
+    -- Checked before the throttle, so no postponed retry is scheduled either.
+    log("giving up after " .. count .. " reloads (" .. reason .. "); plugging or"
+        .. " unplugging a monitor resets this")
+    return
+  end
   local since = seconds_since_reload()
   if since < MIN_GAP then
     log("reload postponed (" .. reason .. "), last reload " .. since .. " s ago")
@@ -301,7 +335,8 @@ local function request_reload(reason)
     local f = io.open(STAMP, "w")
     if f then f:write(tostring(os.time()), "\n"); f:close() end
   end)
-  log("reload (" .. reason .. ")")
+  set_reload_count(count + 1)
+  log("reload " .. (count + 1) .. "/" .. MAX_RELOADS .. " (" .. reason .. ")")
   -- Hyprland 0.56.2's Lua API has no reload dispatcher (hl.dsp.reload_config
   -- is nil: calling it threw, silently, in L11 run 2). Running `hyprctl reload`
   -- is what Keep uses too; it re-runs hyprland.lua and so this file.
@@ -349,10 +384,22 @@ local function recheck_when_memory_expires()
   end
 end
 
+-- A plug/unplug gets a fresh set of MAX_RELOADS attempts. Only for real (or
+-- unidentifiable) monitors: the panel's own events and FALLBACK/HEADLESS
+-- come and go BECAUSE of our reloads, and resetting on them could loop.
+local function reset_reloads_for(name)
+  if is_panel(name) or (name ~= nil and not is_real(name)) then return end
+  if reload_count() > 0 then
+    set_reload_count(0)
+    log("reload count reset (monitor " .. tostring(name) .. " added/removed)")
+  end
+end
+
 -- Handlers.
 local function on_removed(m)
   local name, desc = field(m, "name"), field(m, "description")
   log("event monitor.removed " .. tostring(name) .. " = " .. tostring(desc))
+  reset_reloads_for(name)
   if is_panel(name) then return end  -- our own panel switching
   if is_kept(desc) or desc == nil or name == nil then
     -- Decide from the event itself: don't wait for hl.get_monitors to catch up.
@@ -372,6 +419,7 @@ end
 local function on_added(m)
   local name, desc = field(m, "name"), field(m, "description")
   log("event monitor.added " .. tostring(name) .. " = " .. tostring(desc))
+  reset_reloads_for(name)
   if is_panel(name) then return end
   if is_kept(desc) then  -- it's back: forget every way we remembered it
     local gone = read_gone()
@@ -612,10 +660,11 @@ class MockResult:
 
 def run_mock(lua_text, before, timers=True, event=None, lua="lua", stamp_age=None,
              direct_works=True, run_for=20, gone=None, panel_start=True,
-             reload_fixes=True):
+             reload_fixes=True, reload_count=None):
     """Run generated Lua against the mock (see MOCK_DRIVER). Returns MockResult.
 
     stamp_age: pretend the last handler reload was this many seconds ago.
+    reload_count: pretend the file has already started this many reloads.
     gone: {description: seconds_ago} pre-filled "recently unplugged" memory.
     """
     with tempfile.TemporaryDirectory() as tmp:
@@ -634,6 +683,8 @@ def run_mock(lua_text, before, timers=True, event=None, lua="lua", stamp_age=Non
         t0 = 1000000  # the mock's clock start (os.time() inside the mock)
         if stamp_age is not None:
             (Path(tmp) / "displayctl-reload-stamp").write_text(f"{t0 - stamp_age}\n")
+        if reload_count is not None:
+            (Path(tmp) / "displayctl-reload-count").write_text(f"{reload_count}\n")
         if gone:
             (Path(tmp) / "displayctl-gone").write_text(
                 "".join(f"{t0 - age}\t{d}\n" for d, age in gone.items()))
