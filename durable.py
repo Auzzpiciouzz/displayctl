@@ -106,25 +106,28 @@ def generate_lua(states, descriptions, now=None):
 
 
 # The guarded panel-off rule plus undock/dock safety. Plain Lua that runs on
-# 5.1-5.5 and LuaJIT; every call into Hyprland is inside pcall. Rewritten after
-# live test L11 failed (2026-09-23): after an unplug, the reload's load still
-# saw the unplugged monitor in hl.get_monitors and turned the panel off again,
-# leaving only Hyprland's virtual FALLBACK output (black screen).
+# 5.1-5.5 and LuaJIT; every call into Hyprland is inside pcall. History: L11
+# run 1 (2026-09-23) and run 2 (2026-09-28) left the panel black after an
+# unplug (run 2's cause: the reload call didn't exist, see CLAUDE.md); run 3
+# passed. Simplified after run 3: no direct hl.monitor() enable (it never took
+# effect), no "port:" memory key, FALLBACK/HEADLESS events ignored.
 GUARD_TEMPLATE = r"""-- 3. Laptop panel(s) OFF only while a monitor the layout was kept with is
 --    connected and on. Safety layers (see docs/hyprland-persistence.md):
 --    a) monitor.removed decides from the EVENT's own data: a kept-with (or
---       unidentifiable) monitor gone -> panel ON directly, and it's
---       remembered as gone for GONE_TTL s, because hl.get_monitors can
---       still list it for a few seconds. If the event object has no
---       description, its port is remembered instead ("port:DP-3"); if it
---       has neither, every kept-with monitor counts as gone ("*");
+--       unidentifiable) monitor gone -> reload at once, and it's remembered
+--       as gone for GONE_TTL s, so the reload's load turns the panel ON even
+--       if hl.get_monitors still lists it. An event without a description
+--       makes every kept-with monitor count as gone ("*");
 --    b) "never zero screens": after every load, event and re-check, if no
---       real monitor is on (FALLBACK/headless don't count) -> panel ON;
+--       real monitor is on (FALLBACK/headless don't count) -> reload so the
+--       panel comes ON;
 --    c) delayed re-checks after loads and events, reload if the answer
 --       changed (at most one reload per MIN_GAP s, postponed not dropped;
 --       at most MAX_RELOADS in a row, the count resets on any real monitor
 --       being added or removed);
---    d) a diagnostic log of every load, event and decision.
+--    d) a diagnostic log of every load, event and decision; events for the
+--       panel itself and for FALLBACK/HEADLESS are logged but otherwise
+--       ignored (they come and go BECAUSE of our reloads).
 --    Any error or doubt: the panel stays / comes ON.
 local PANELS = { @PANELS@ }
 local KEPT_WITH = { @KEPT_WITH@ }
@@ -231,7 +234,7 @@ local function kept_with_present()
   local gone = read_gone()
   for _, m in ipairs(monitors()) do
     local name, desc = field(m, "name"), field(m, "description")
-    local is_gone = gone[desc] or gone["port:" .. tostring(name)] or gone["*"]
+    local is_gone = gone[desc] or gone["*"]
     if is_real(name) and not is_panel(name) and is_kept(desc) and not is_gone then
       return true
     end
@@ -343,19 +346,13 @@ local function request_reload(reason)
   hl.exec_cmd("hyprctl reload")
 end
 
-local function enable_panels_now(reason)
-  -- Best effort only: on 0.56.2 a monitor rule added at runtime is stored but
-  -- not applied (L11 run 2: no error, panel stayed off). The reload below is
-  -- the real rescue; this stays in case a later Hyprland applies it at once.
-  for _, panel in ipairs(PANELS) do
-    local ok = pcall(hl.monitor, { output = panel, mode = "preferred", position = "auto", scale = 1 })
-    log("panel " .. panel .. " ON directly (" .. reason .. ")" .. (ok and "" or " [hl.monitor failed]"))
-  end
-  -- The direct rule usually doesn't take effect, so reload (the load then
-  -- honours the "gone" memory, so it won't turn the panel off again).
-  after(1000, function()
-    if not panel_listed() then request_reload("panel still off after direct enable") end
-  end)
+-- Turn the panel(s) back on with a reload: the load honours the "gone"
+-- memory, so it won't turn them off again, and the catch-all turns them on.
+-- No direct hl.monitor() first: on 0.56.2 a monitor rule added at runtime is
+-- stored but not applied until a reload (L11 runs 2 and 3).
+local function rescue_panels(reason)
+  if panel_listed() then return end  -- already on: nothing to do
+  request_reload(reason)
 end
 
 local function recheck(reason)
@@ -366,7 +363,7 @@ local function recheck(reason)
       .. tostring(want) .. ", real monitors on " .. real .. ", loaded with panel "
       .. (PANELS_OFF and "OFF" or "on"))
   if real == 0 then  -- invariant: never zero screens
-    enable_panels_now("no real monitor on")
+    rescue_panels("no real monitor on")
     return
   end
   if want ~= PANELS_OFF then request_reload(reason) end
@@ -384,14 +381,21 @@ local function recheck_when_memory_expires()
   end
 end
 
--- A plug/unplug gets a fresh set of MAX_RELOADS attempts. Only for real (or
--- unidentifiable) monitors: the panel's own events and FALLBACK/HEADLESS
--- come and go BECAUSE of our reloads, and resetting on them could loop.
-local function reset_reloads_for(name)
-  if is_panel(name) or (name ~= nil and not is_real(name)) then return end
+-- Events we log but otherwise ignore: the panel's own (our reloads switch it)
+-- and Hyprland's FALLBACK/HEADLESS outputs (added when the last monitor goes,
+-- removed, twice, when one comes back). All of them are caused by other
+-- events or by our reloads, so reacting to them would only repeat work, and
+-- resetting the reload count on them could loop. An unreadable name (nil)
+-- is NOT ignored: it may be a real monitor.
+local function ignored(name)
+  return is_panel(name) or (name ~= nil and not is_real(name))
+end
+
+-- A plug/unplug of a real monitor gets a fresh set of MAX_RELOADS attempts.
+local function reset_reload_count()
   if reload_count() > 0 then
     set_reload_count(0)
-    log("reload count reset (monitor " .. tostring(name) .. " added/removed)")
+    log("reload count reset (a monitor was added/removed)")
   end
 end
 
@@ -399,18 +403,20 @@ end
 local function on_removed(m)
   local name, desc = field(m, "name"), field(m, "description")
   log("event monitor.removed " .. tostring(name) .. " = " .. tostring(desc))
-  reset_reloads_for(name)
-  if is_panel(name) then return end  -- our own panel switching
+  if ignored(name) then return end
+  reset_reload_count()
   if is_kept(desc) or desc == nil or name == nil then
     -- Decide from the event itself: don't wait for hl.get_monitors to catch up.
-    -- Remember it as gone by the best key the event gives us. Without this, a
-    -- reload while hl.get_monitors is still stale would turn the panel off
-    -- again (the L11 failure). A wrong guess only keeps an extra screen on.
-    local key = desc or (name and ("port:" .. name)) or "*"
+    -- Remember it as gone BEFORE reloading, so the reload's load turns the
+    -- panel on even if hl.get_monitors still lists it. Without a description
+    -- we can't tell which monitor it was: every kept-with monitor counts as
+    -- gone ("*"). A wrong guess only keeps an extra screen on until the
+    -- memory expires. (In L11 every unplug event carried its description.)
+    local key = desc or "*"
     local gone = read_gone(); gone[key] = os.time(); write_gone(gone)
     log("remembered as gone: " .. key)
     recheck_when_memory_expires()
-    if PANELS_OFF then enable_panels_now("kept-with monitor removed") end
+    if PANELS_OFF then rescue_panels("kept-with monitor removed") end
   end
   after(1000, function() recheck("1 s after removal") end)
   after(3000, function() recheck("3 s after removal") end)
@@ -419,11 +425,11 @@ end
 local function on_added(m)
   local name, desc = field(m, "name"), field(m, "description")
   log("event monitor.added " .. tostring(name) .. " = " .. tostring(desc))
-  reset_reloads_for(name)
-  if is_panel(name) then return end
-  if is_kept(desc) then  -- it's back: forget every way we remembered it
+  if ignored(name) then return end
+  reset_reload_count()
+  if is_kept(desc) then  -- it's back: forget both ways we may have remembered it
     local gone = read_gone()
-    gone[desc] = nil; gone["port:" .. tostring(name)] = nil; gone["*"] = nil
+    gone[desc] = nil; gone["*"] = nil
     write_gone(gone)
   end
   after(1000, function() recheck("1 s after addition") end)
@@ -700,7 +706,7 @@ def run_mock(lua_text, before, timers=True, event=None, lua="lua", stamp_age=Non
 
 
 FALLBACK_MONITOR = {"name": "FALLBACK", "description": ""}  # what Hyprland adds when the last monitor goes
-UNDOCK_BLACK_MAX = 1.5  # seconds the panel may stay off after an unplug (mock time)
+UNDOCK_BLACK_MAX = 0.5  # seconds the panel may stay off after an unplug (mock time)
 
 
 def self_check(lua_text, data):

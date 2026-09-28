@@ -155,8 +155,9 @@ class U1Undock(unittest.TestCase):
                     # must leave the panel on (the Samsung really is gone).
                     r = undock(slow, lua=lua, run_for=40)
                     self.assertTrue(r.panel_on)
-                    self.assertEqual(r.black, 0.0)          # on at the event itself
-                    self.assertGreaterEqual(r.direct, 1)
+                    self.assertEqual(r.black, 0.0)          # reloaded at the event itself
+                    self.assertEqual(r.reload_at[0], 1.0)
+                    self.assertEqual(r.direct, 0)           # no direct hl.monitor() any more
                     self.assertLessEqual(r.reloads, 2)      # no loop
                     self.assertEqual(r.pending, 0)          # everything settled
 
@@ -209,13 +210,18 @@ class U1Undock(unittest.TestCase):
                     "name": "monitor.added", "monitor": dell, "after": [dell], "at": 1})
                 self.assertEqual(r.reloads, 0)
 
-    def test_m_rate_limit_postpones_but_panel_still_on_at_once(self):
+    def test_m_rate_limit_postpones_the_rescue_but_doesnt_drop_it(self):
+        # A reload 1 s before the load, unplug at 1 s: the rescue reload waits
+        # for MIN_GAP (5 s since the last reload), then the panel comes on.
+        # (Before 2026-09-28 a direct hl.monitor() was meant to cover this
+        # wait, but on real hardware it never took effect.)
         for lua in INTERPRETERS:
             with self.subTest(lua=lua):
-                r = undock(3, lua=lua, stamp_age=1)     # a reload 1 s before the load
+                r = undock(3, lua=lua, stamp_age=1)
                 self.assertTrue(r.panel_on)
-                self.assertEqual(r.black, 0.0)          # the direct enable doesn't wait
+                self.assertLessEqual(r.black, 3.2)      # 5 s gap - 2 s already passed + 0.1
                 self.assertTrue(r.reload_at and min(r.reload_at) >= 4.0, r.reload_at)
+                self.assertIn("reload postponed (kept-with monitor removed)", r.log)
 
     def test_n_without_timers(self):
         for lua in INTERPRETERS:
@@ -235,10 +241,9 @@ class U1Undock(unittest.TestCase):
 
     def test_o2_unidentifiable_removal_survives_stale_list_and_failed_direct_enable(self):
         # Worst case: the event gives no description (or no readable object at
-        # all), the direct enable doesn't work, and get_monitors stays stale.
-        # The rescue reload must still leave the panel on: the handler
-        # remembers the port, or "*" if even the name is unreadable. Before
-        # this fix the panel stayed black for slow >= ~4 s.
+        # all) and get_monitors stays stale. The rescue reload must still
+        # leave the panel on: the handler remembers "*" (every kept-with
+        # monitor counts as gone).
         for lua in INTERPRETERS:
             for monitor in ("destroyed", {"name": "DP-3"}):
                 for slow in (3, 8, 20):
@@ -251,9 +256,9 @@ class U1Undock(unittest.TestCase):
                         self.assertLessEqual(r.black, 1.5)
                         self.assertLessEqual(r.reloads, 2)
 
-    def test_o3_port_and_wildcard_memory_cleared_on_replug(self):
+    def test_o3_wildcard_memory_cleared_on_replug(self):
         lua = INTERPRETERS[0]
-        for key in ("port:DP-3", "*"):
+        for key in ("*",):
             with self.subTest(key=key):
                 # Remembered, Samsung listed: the load keeps the panel on (safe side).
                 r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, gone={key: 5})
@@ -303,8 +308,10 @@ class U1Undock(unittest.TestCase):
 
     def test_r_log_records_loads_events_and_decisions(self):
         r = undock(3, lua=INTERPRETERS[0])
-        for needle in ("load: monitors", "event monitor.removed DP-3", "ON directly",
-                       "check (1 s after removal)", "reload 1/10 (", "-> panel on"):
+        for needle in ("load: monitors", "event monitor.removed DP-3",
+                       "remembered as gone: " + SAMSUNG,
+                       "reload 1/10 (kept-with monitor removed)", "check (2.5 s after load)",
+                       "-> panel on"):
             self.assertIn(needle, r.log)
 
 
@@ -447,13 +454,74 @@ class U1L11Run2(unittest.TestCase):
     def test_errors_in_callbacks_are_logged(self):
         # A callback that throws must leave a line in the log, not vanish.
         text = gen(docked_edp_off()).replace(
-            'recheck("1 s after removal")', 'error("boom")')
+            'recheck("2.5 s after load")', 'error("boom")')
         r = undock(0, lua=INTERPRETERS[0], run_for=5, direct_works=False)
         self.assertNotIn("boom", r.log)
         r = durable.run_mock(text, [DP3], lua=INTERPRETERS[0], run_for=5, event={
             "name": "monitor.removed", "monitor": DP3, "after": [], "at": 1})
         self.assertIn("ERROR in timer:", r.log)
         self.assertIn("boom", r.log)
+
+
+class U1AfterL11(unittest.TestCase):
+    """Template simplified after L11 run 3 (2026-09-28): the rescue is an
+    immediate reload (no direct hl.monitor), no "port:" memory key, and
+    FALLBACK/HEADLESS events are ignored."""
+
+    def test_unplug_reloads_at_the_event_on_real_hardware(self):
+        # Direct enable not working (as on 0.56.2): the panel is still on at
+        # the event itself, because the reload no longer waits 1 s.
+        for lua in INTERPRETERS:
+            for slow in (0, 3, 8):
+                with self.subTest(lua=lua, slow=slow):
+                    r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=lua, direct_works=False,
+                                         run_for=40, event={"name": "monitor.removed", "monitor": DP3,
+                                                            "after": [FALLBACK], "at": 1, "slow": slow})
+                    self.assertEqual(r.reload_at, [1.0])
+                    self.assertEqual(r.black, 0.0)
+                    self.assertEqual(r.direct, 0)
+                    self.assertTrue(r.panel_on)
+
+    def test_virtual_output_events_are_ignored(self):
+        # Docked and settled; FALLBACK/HEADLESS come or go: logged, nothing
+        # else (no re-checks, no gone memory, no reload, no count reset).
+        for monitor in (FALLBACK, {"name": "HEADLESS-2", "description": "Headless"}):
+            for name in ("monitor.added", "monitor.removed"):
+                with self.subTest(monitor=monitor["name"], event=name):
+                    r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=INTERPRETERS[0],
+                                         reload_count=3, event={"name": name, "monitor": monitor,
+                                                                "after": [DP3], "at": 1})
+                    self.assertIn(f"event {name} {monitor['name']}", r.log)
+                    self.assertNotIn("after addition", r.log)
+                    self.assertNotIn("after removal", r.log)
+                    self.assertNotIn("remembered as gone", r.log)
+                    self.assertNotIn("reload count reset", r.log)
+                    self.assertEqual(r.reloads, 0)
+                    self.assertFalse(r.panel_on)
+
+    def test_real_events_still_recheck(self):
+        # Contrast with the test above: a real monitor still gets its re-checks.
+        other = {"name": "HDMI-A-1", "description": "Some Other Monitor"}
+        r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=INTERPRETERS[0], event={
+            "name": "monitor.added", "monitor": other, "after": [DP3, other], "at": 1})
+        self.assertIn("check (1 s after addition)", r.log)
+        self.assertIn("check (3 s after addition)", r.log)
+
+    def test_named_event_without_description_is_remembered_as_wildcard(self):
+        r = durable.run_mock(gen(docked_edp_off()), [DP3], lua=INTERPRETERS[0], event={
+            "name": "monitor.removed", "monitor": {"name": "DP-3"}, "after": [FALLBACK], "at": 1})
+        self.assertIn("remembered as gone: *", r.log)
+        self.assertNotIn("port:", r.log)
+        self.assertTrue(r.panel_on)
+
+    def test_template_has_no_port_key_or_direct_enable(self):
+        text = durable.GUARD_TEMPLATE
+        self.assertNotIn('"port:"', text)
+        self.assertNotIn("enable_panels_now", text)
+        # The only hl.monitor calls left are the load-time disable rules.
+        code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("--"))
+        self.assertEqual(code.count("hl.monitor"), 1)
+        self.assertIn("hl.monitor({ output = panel, disabled = true })", code)
 
 
 class U2Files(unittest.TestCase):

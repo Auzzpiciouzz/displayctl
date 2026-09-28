@@ -208,7 +208,7 @@ tests missed it because the mock's monitor list changed instantly.
 Immediately afterwards the file was regenerated WITHOUT any eDP-1 rule
 (Option B); kanshi handles eDP-1 again until the fix passes L11.
 
-The fix (durable.GUARD_TEMPLATE, not yet live-tested):
+The fix (durable.GUARD_TEMPLATE; later changed, see "After L11" below):
 - `monitor.removed` decides from the event's own data: a kept-with (or
   unidentifiable) monitor removed -> the panel is turned ON directly
   (`hl.monitor` with preferred/auto), and the monitor is remembered as
@@ -238,6 +238,29 @@ The fix (durable.GUARD_TEMPLATE, not yet live-tested):
   "black" time. With the fix: panel on at the event, 0 s black, for
   stale lists of 0-20 s; without the gone memory the model reproduces the
   live failure (test i3). self_check runs the stale-list undock too.
+
+### After L11 (2026-09-28): what changed in the template
+
+L11 run 2 failed because the rescue reload called a dispatcher that doesn't
+exist (see CLAUDE.md). Run 3 passed with `hyprctl reload`, a reload cap and
+error logging. Then, from what run 3 showed on the real hardware:
+- **No direct enable.** A runtime `hl.monitor()` never took effect (it only
+  applies at the next reload). The rescue is now an immediate reload: on
+  a kept-with unplug, the file writes the "gone" memory and reloads at once
+  (no 1 s wait); the "never zero screens" invariant also reloads (only if
+  the panel isn't listed). The throttle still applies: within 5 s of
+  another reload, the rescue is postponed (test m).
+- **No `port:` key.** Every unplug event in L11 carried its description.
+  An event without one now remembers `*` (every kept-with monitor counts
+  as gone for 30 s), which does the same job for a single-monitor dock.
+  `*` and its expiry re-check stay as insurance (tests o2, o4).
+- **FALLBACK/HEADLESS events are ignored** (logged only), like the panel's
+  own events. They're caused by real unplugs/replugs or by our reloads.
+  Hyprland emits `monitor.removed FALLBACK` twice per replug.
+- The "gone" memory stays, although no L11 log showed a stale
+  `get_monitors`: every check 1 s after an unplug already had the monitor
+  gone. It's insurance against run 1's suspected cause, and it matters
+  more now that the reload happens at the event itself.
 
 Next: re-run L11 (with the recorder started BEFORE unplugging) once the
 user approves; only then Keep layouts with eDP-1 off again.
