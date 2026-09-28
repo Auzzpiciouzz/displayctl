@@ -4,6 +4,9 @@
   displayctl.py list
   displayctl.py set OUTPUT [--mode WxH[@Hz]] [--pos X,Y] [--scale S]
                            [--transform T] [--enable | --disable] [--dry-run]
+  displayctl.py preset external|extend [--dry-run]
+
+`preset` changes every output in one step; it's what Super+P runs.
 
 How `set` stays safe:
   1. snapshot the current state -> ~/.cache/displayctl/last-good.json
@@ -58,7 +61,7 @@ def die(msg):
 
 # Commands that change outputs (or our rules file). kanshi can override
 # those; `list` only reads, so it gets no warning.
-CHANGING_COMMANDS = ("set", "persist", "undo")
+CHANGING_COMMANDS = ("set", "persist", "undo", "preset")
 
 
 def warn_if_kanshi(command, stream=None):
@@ -421,6 +424,93 @@ def stale_serial_test(args):
         print("Nothing to revert.")
 
 
+# --- preset (Super+P menu) ---------------------------------------------------------
+
+# Windows-style one-step layouts, like Win+P. "Laptop only" is left out on
+# purpose: the guarded monitors.lua treats a protocol-disabled Samsung as
+# unplugged and reloads it back on within ~1 s (CLAUDE.md, Next steps).
+PRESETS = ("external", "extend")
+
+
+def best_mode(head):
+    """The mode a head gets when a preset turns it on: its preferred size
+    at that size's highest refresh rate (Samsung: 1440p@200, eDP-1:
+    1080p@144, the same modes the old kanshi profiles used). The Samsung
+    marks no mode as preferred; preferred_mode() then takes the first one
+    listed, which is its 1440p."""
+    preferred = head.preferred_mode()
+    if preferred is None:
+        return None
+    return head.find_mode(preferred.width, preferred.height)
+
+
+def build_preset(heads, name):
+    """Return {head name: state} for preset `name`, for EVERY head.
+
+    external: every external monitor on, laptop panel(s) off.
+    extend:   everything on, side by side at y=0: panel(s) on the LEFT,
+              then the externals (the user's choice, as kanshi had it).
+    A head that is already on keeps its mode, scale and rotation; a head
+    being turned on gets best_mode(), scale 1, no rotation.
+    Raises ValueError if the preset can't be built (no external monitor).
+    """
+    if name not in PRESETS:
+        raise ValueError(f"unknown preset {name!r} (have: {', '.join(PRESETS)})")
+    panels = sorted((h for h in heads if durable.is_panel(h.name)), key=lambda h: h.name)
+    externals = sorted((h for h in heads if not durable.is_panel(h.name)), key=lambda h: h.name)
+    if not externals:
+        raise ValueError("no external monitor connected")
+    on = externals if name == "external" else panels + externals
+
+    desired = {}
+    x = 0  # next free x position, left to right
+    for head in on:
+        state = head.to_state()
+        if not (head.enabled and head.current_mode):
+            mode = best_mode(head)
+            if mode is None:
+                raise ValueError(f"{head.name} reports no modes")
+            state.update(enabled=True, scale=1.0, transform=0, mode={
+                "width": mode.width, "height": mode.height, "refresh_mhz": mode.refresh_mhz})
+        state["position"] = [x, 0]
+        desired[head.name] = state
+        x += logical_width(state)
+    for head in heads:
+        if head.name not in desired:
+            state = head.to_state()
+            state.update(enabled=False, mode=None)
+            desired[head.name] = state
+    return desired
+
+
+def logical_width(state):
+    """Width in layout coordinates: pixels / scale, height if rotated 90/270
+    (same rule as Head.logical_size, but for a state that isn't live yet)."""
+    m = state["mode"]
+    side = m["height"] if state["transform"] % 2 == 1 else m["width"]
+    return round(side / state["scale"])
+
+
+def cmd_preset(args):
+    lock = take_lock()
+    om = OutputManager()
+    try:
+        try:
+            desired = build_preset(om.heads, args.name)
+        except ValueError as e:
+            die(str(e))
+        now = {h.name: h.to_state() for h in om.heads}
+        if all(describe(now[n]) == describe(s) for n, s in desired.items()):
+            print(f"Already '{args.name}'; nothing to do.")
+            return
+        print(f"Preset '{args.name}':")
+        for n in sorted(desired):
+            print(f"  {n}: {describe(now[n])}  ->  {describe(desired[n])}")
+        apply_and_confirm(om, lock, desired, args)
+    finally:
+        om.close()
+
+
 def cmd_set(args):
     if args.stale_serial_test:
         stale_serial_test(args)
@@ -442,129 +532,138 @@ def cmd_set(args):
         print(f"{target}:")
         print(f"  now: {describe(before)}")
         print(f"  new: {describe(after)}")
-
-        # 0. Guard (Hyprland only): the protocol and hyprctl must agree on
-        #    the current state. We restate every head in full, so a wrong
-        #    view would be applied for real. Never guess which is right.
-        problems = hyprland_disagreements(om.heads)
-        if problems:
-            print("REFUSING TO APPLY: the protocol and hyprctl disagree:", file=sys.stderr)
-            for p in problems:
-                print(f"  {p}", file=sys.stderr)
-            die("fix the mismatch first (see CLAUDE.md findings); nothing was changed")
-
-        # 1. Snapshot, before anything else touches the displays.
-        snapshot = om.snapshot()
-        save_json(LAST_GOOD, snapshot)
-        print(f"Saved current state to {LAST_GOOD}")
-
-        # 2. Test: the compositor checks the configuration but changes nothing.
-        #    EXCEPT on Hyprland (0.56.2): there test() makes it re-apply its
-        #    config rules to all outputs, which can switch a disabled
-        #    output back on. So on Hyprland we rely on our own checks
-        #    (build_desired: mode exists, scale > 0, not everything off)
-        #    plus the hyprctl cross-check above. See
-        #    docs/hyprland-persistence.md, "test() is not side-effect-free".
-        if on_hyprland():
-            print("test() skipped on Hyprland: it re-applies Hyprland's config "
-                  "rules as a side effect. Local checks and hyprctl cross-check passed.")
-        else:
-            result = om.run_configuration(desired, "test")
-            if result != "succeeded":
-                die(f"test {result}. {RESULT_MESSAGES[result]} Nothing was changed.")
-            print("Test passed.")
-        if args.dry_run:
-            print("--dry-run: stopping before apply.")
-            return
-
-        # 3. Start the watchdog BEFORE applying, so it exists if we crash mid-apply.
-        # The watchdog's deadline must outlast our own wait, however long it is.
-        wait_seconds = args.auto_revert_after or args.self_revert_test or CONFIRM_SECONDS
-        # + VERIFY_SECONDS: verifying the apply (step 5b) happens before the
-        # countdown starts, so the watchdog must allow for it too.
-        watchdog = start_watchdog(lock, max(CONFIRM_SECONDS, wait_seconds) + VERIFY_SECONDS)
-
-        # 4. Apply.
-        try:
-            result = om.run_configuration(desired, "apply")
-        except WaylandError as e:
-            print(f"apply: {e}")
-            tell(watchdog, "revert")
-            wait_for_revert(watchdog)
-            sys.exit(1)
-
-        if result == "cancelled":
-            print(RESULT_MESSAGES["cancelled"])
-            tell(watchdog, "keep")  # nothing was applied, nothing to undo
-            sys.exit(1)
-        if result == "failed":
-            # The compositor should have undone any partial change itself.
-            # Restore the snapshot anyway, to be sure.
-            print(f"apply failed. {RESULT_MESSAGES['failed']}")
-            tell(watchdog, "revert")
-            wait_for_revert(watchdog)
-            sys.exit(1)
-
-        # 5. It's live. Ask the user, with the watchdog as a backup.
-        tell(watchdog, "applied")
-        if args.self_revert_test is not None:
-            # Experiment: this must run BEFORE the early close below, because
-            # it's about reverting while the applying connection is still open.
-            self_revert_test(om, watchdog, snapshot, args)
-            return
-        # Close our Wayland connection now. REQUIRED, not tidiness: on
-        # Hyprland, while the client that applied a change stays connected,
-        # a revert applied by another client (the watchdog) is answered
-        # "succeeded" but not carried out. Tested: 144 -> 180 -> revert
-        # worked with this close and failed without it.
-        om.close()
-
-        # 5b. Did it actually happen? "succeeded" only means accepted: on
-        # Hyprland a change is silently ignored while another client that
-        # applied the last change is still connected. Same check as for
-        # reverts (fresh read, then again 2 s later). Never report success
-        # for a change that didn't happen.
-        problems = verify_applied(desired)
-        if problems:
-            print("The compositor said 'succeeded', but the change did NOT take effect:")
-            for p in problems:
-                print(f"  {p}")
-            print("(Another client that applied a change may still be connected, e.g. "
-                  "kanshi or the GUI; see CLAUDE.md.)")
-            tell(watchdog, "revert")
-            wait_for_revert(watchdog)
-            sys.exit(1)
-        print("Verified: the displays match the requested settings.")
-        if args.auto_keep:
-            # Testing aid: confirm without a terminal, like pressing "y".
-            print("--auto-keep: keeping")
-            keep = True
-        elif args.auto_revert_after is not None:
-            # Testing aid: no prompt, just hold the change for a while and
-            # then revert, like a user who waited and pressed "n".
-            print(f"--auto-revert-after: holding for {args.auto_revert_after}s, then reverting")
-            time.sleep(args.auto_revert_after)
-            keep = False
-        else:
-            try:
-                keep = confirm(CONFIRM_SECONDS)
-            except KeyboardInterrupt:
-                print()
-                keep = False
-        if keep:
-            tell(watchdog, "keep")
-            watchdog.wait(timeout=10)
-            # Re-read on a fresh connection: our old one is closed, and its
-            # state was from just after apply (possibly before all the
-            # compositor's update events had arrived).
-            with OutputManager() as fresh:
-                print(f"Kept. {target}: {describe(fresh.head(target).to_state())}")
-            make_durable()
-        else:
-            tell(watchdog, "revert")
-            wait_for_revert(watchdog)
+        apply_and_confirm(om, lock, desired, args)
     finally:
         om.close()
+
+
+def apply_and_confirm(om, lock, desired, args):
+    """Steps 0-5 of a change (see the module docstring), shared by `set`
+    and `preset`: guard, snapshot, test, watchdog, apply, verify, ask,
+    then keep (made durable) or revert. `desired` = every head's state.
+    The caller holds `lock` and closes `om`."""
+    # 0. Guard (Hyprland only): the protocol and hyprctl must agree on
+    #    the current state. We restate every head in full, so a wrong
+    #    view would be applied for real. Never guess which is right.
+    problems = hyprland_disagreements(om.heads)
+    if problems:
+        print("REFUSING TO APPLY: the protocol and hyprctl disagree:", file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        die("fix the mismatch first (see CLAUDE.md findings); nothing was changed")
+
+    # 1. Snapshot, before anything else touches the displays.
+    snapshot = om.snapshot()
+    save_json(LAST_GOOD, snapshot)
+    print(f"Saved current state to {LAST_GOOD}")
+
+    # 2. Test: the compositor checks the configuration but changes nothing.
+    #    EXCEPT on Hyprland (0.56.2): there test() makes it re-apply its
+    #    config rules to all outputs, which can switch a disabled
+    #    output back on. So on Hyprland we rely on our own checks
+    #    (build_desired: mode exists, scale > 0, not everything off)
+    #    plus the hyprctl cross-check above. See
+    #    docs/hyprland-persistence.md, "test() is not side-effect-free".
+    if on_hyprland():
+        print("test() skipped on Hyprland: it re-applies Hyprland's config "
+              "rules as a side effect. Local checks and hyprctl cross-check passed.")
+    else:
+        result = om.run_configuration(desired, "test")
+        if result != "succeeded":
+            die(f"test {result}. {RESULT_MESSAGES[result]} Nothing was changed.")
+        print("Test passed.")
+    if args.dry_run:
+        print("--dry-run: stopping before apply.")
+        return
+
+    # 3. Start the watchdog BEFORE applying, so it exists if we crash mid-apply.
+    # The watchdog's deadline must outlast our own wait, however long it is.
+    wait_seconds = args.auto_revert_after or args.self_revert_test or CONFIRM_SECONDS
+    # + VERIFY_SECONDS: verifying the apply (step 5b) happens before the
+    # countdown starts, so the watchdog must allow for it too.
+    watchdog = start_watchdog(lock, max(CONFIRM_SECONDS, wait_seconds) + VERIFY_SECONDS)
+
+    # 4. Apply.
+    try:
+        result = om.run_configuration(desired, "apply")
+    except WaylandError as e:
+        print(f"apply: {e}")
+        tell(watchdog, "revert")
+        wait_for_revert(watchdog)
+        sys.exit(1)
+
+    if result == "cancelled":
+        print(RESULT_MESSAGES["cancelled"])
+        tell(watchdog, "keep")  # nothing was applied, nothing to undo
+        sys.exit(1)
+    if result == "failed":
+        # The compositor should have undone any partial change itself.
+        # Restore the snapshot anyway, to be sure.
+        print(f"apply failed. {RESULT_MESSAGES['failed']}")
+        tell(watchdog, "revert")
+        wait_for_revert(watchdog)
+        sys.exit(1)
+
+    # 5. It's live. Ask the user, with the watchdog as a backup.
+    tell(watchdog, "applied")
+    if args.self_revert_test is not None:
+        # Experiment: this must run BEFORE the early close below, because
+        # it's about reverting while the applying connection is still open.
+        self_revert_test(om, watchdog, snapshot, args)
+        return
+    # Close our Wayland connection now. REQUIRED, not tidiness: on
+    # Hyprland, while the client that applied a change stays connected,
+    # a revert applied by another client (the watchdog) is answered
+    # "succeeded" but not carried out. Tested: 144 -> 180 -> revert
+    # worked with this close and failed without it.
+    om.close()
+
+    # 5b. Did it actually happen? "succeeded" only means accepted: on
+    # Hyprland a change is silently ignored while another client that
+    # applied the last change is still connected. Same check as for
+    # reverts (fresh read, then again 2 s later). Never report success
+    # for a change that didn't happen.
+    problems = verify_applied(desired)
+    if problems:
+        print("The compositor said 'succeeded', but the change did NOT take effect:")
+        for p in problems:
+            print(f"  {p}")
+        print("(Another client that applied a change may still be connected, e.g. "
+              "kanshi or the GUI; see CLAUDE.md.)")
+        tell(watchdog, "revert")
+        wait_for_revert(watchdog)
+        sys.exit(1)
+    print("Verified: the displays match the requested settings.")
+    if args.auto_keep:
+        # Testing aid: confirm without a terminal, like pressing "y".
+        print("--auto-keep: keeping")
+        keep = True
+    elif args.auto_revert_after is not None:
+        # Testing aid: no prompt, just hold the change for a while and
+        # then revert, like a user who waited and pressed "n".
+        print(f"--auto-revert-after: holding for {args.auto_revert_after}s, then reverting")
+        time.sleep(args.auto_revert_after)
+        keep = False
+    else:
+        try:
+            keep = confirm(CONFIRM_SECONDS)
+        except KeyboardInterrupt:
+            print()
+            keep = False
+    if keep:
+        tell(watchdog, "keep")
+        watchdog.wait(timeout=10)
+        # Re-read on a fresh connection: our old one is closed, and its
+        # state was from just after apply (possibly before all the
+        # compositor's update events had arrived).
+        with OutputManager() as fresh:
+            for head in fresh.heads:
+                if head.name in desired:
+                    print(f"Kept. {head.name}: {describe(head.to_state())}")
+        make_durable()
+    else:
+        tell(watchdog, "revert")
+        wait_for_revert(watchdog)
 
 
 def verify_applied(desired):
@@ -643,6 +742,14 @@ def main():
     # Hidden: one swap step, for the GUI's Undo (it asks its own question).
     u.add_argument("--swap-only", action="store_true", help=argparse.SUPPRESS)
 
+    pr = sub.add_parser("preset", help="switch to a whole layout (Super+P), with 15s auto-revert")
+    pr.add_argument("name", choices=PRESETS,
+                    help="external: external monitor(s) only; extend: laptop left of the externals")
+    pr.add_argument("--dry-run", action="store_true", help="show the layout; never apply")
+    pr.add_argument("--auto-revert-after", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
+    pr.add_argument("--auto-keep", action="store_true", help=argparse.SUPPRESS)
+    pr.set_defaults(self_revert_test=None)  # apply_and_confirm's `set`-only experiment
+
     p = sub.add_parser("set", help="change one output, with test + 15s auto-revert")
     p.add_argument("output", help="output name, e.g. DP-3 or eDP-1")
     p.add_argument("--mode", type=parse_mode, help="WxH or WxH@Hz, e.g. 2560x1440@144")
@@ -677,6 +784,8 @@ def main():
             cmd_persist(args)
         elif args.command == "undo":
             cmd_undo(args)
+        elif args.command == "preset":
+            cmd_preset(args)
         else:
             cmd_set(args)
     except WaylandError as e:
