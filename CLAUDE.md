@@ -196,9 +196,9 @@ GTK); gui.py handles edits from GLib.idle_add.
    guarded monitors.lua can't tell from an unplug. The 1 s re-check then
    reloads, the DP-3 rule turns it back on, and ~31 s later the panel goes
    off again. Needs an override that the Lua honours (dock daemon).
-   NOT live-tested yet: a Keep rewrites the live monitors.lua (needs the
-   user). Test: Super+P -> Extend -> Keep, then Super+P -> External only
-   -> Keep; also Revert and a 15 s timeout.
+   Live test PASSED 2026-09-28 (user): Super+P -> Extend and -> External
+   only, each with Keep, Revert and the 15 s timeout, all worked. Ended
+   on External only, so the guarded monitors.lua is live again.
    118 tests pass.
 4. Then Phase 4: the dock daemon (rule-based dock switching in Lua on
    Hyprland; design in docs/hyprland-persistence.md), replacing kanshi.
