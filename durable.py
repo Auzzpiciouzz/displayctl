@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-DIR = Path.home() / ".config" / "hypr" / "displayctl"
+DIR = Path.home() / ".config" / "caelestia" / "displayctl"
 LUA_NAME = "monitors.lua"
 JSON_NAME = "monitors.json"
 PANEL_PREFIXES = ("eDP-", "LVDS-", "DSI-")  # laptop panels (never disabled unguarded)
@@ -883,7 +883,7 @@ def load_json(directory=DIR, prev=False):
 #  so we reload explicitly, exactly once; `hyprctl reload` works with the Lua
 #  config and doesn't re-run hyprland.start autostarts.)
 
-HYPRLAND_LUA = Path.home() / ".config" / "hypr" / "hyprland.lua"
+HYPRLAND_LUA = Path.home() / ".config" / "caelestia" / "hypr-user.lua"
 
 
 def dofile_line_present(config=HYPRLAND_LUA, directory=DIR):
